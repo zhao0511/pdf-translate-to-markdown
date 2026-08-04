@@ -46,7 +46,7 @@ Obsidian 直接加载构建生成的 `main.js`。
 
 ### Mistral
 
-1. 在 [Mistral API Keys](https://admin.mistral.ai/plateforme/api-keys) 创建密钥。
+1. 在 [Mistral API Keys](https://admin.mistral.ai/organization/api-keys) 创建密钥。
 2. 将密钥粘贴到“Mistral API 密钥”。
 3. PDF 一键翻译同时需要 Mistral 和 DeepSeek 密钥。
 4. 订阅与用量可在 [Mistral Subscription](https://admin.mistral.ai/subscription) 查看。
