@@ -15,11 +15,30 @@
 - 已有结果不会被覆盖，会自动选择 `paper 2`、`paper 3` 等新名称。
 - 持续显示“上传至 Mistral”“Mistral OCR 中”“DeepSeek 翻译中”等任务状态和等待时间。
 - 每次任务结束后检查 GitHub Release；发现新版后可在设置页点击“更新”。
+- 提供 Windows 图形安装向导，可选择 Vault 后自动安装、修复或更新插件。
 - 支持 Obsidian Secret Storage，不会读取其他插件保存的 API 密钥。
 
 ## 安装
 
-### 从 Release 安装
+### Windows 安装向导（推荐）
+
+1. 打开 [Releases](https://github.com/zhao0511/pdf-translate-to-markdown/releases)。
+2. 下载最新 Release 中的 `PdfTranslateToMarkdown-Setup.exe` 并打开。
+3. 点击“选择…”，选择需要安装插件的 Obsidian 仓库根目录，也就是内部包含 `.obsidian` 文件夹的目录。
+4. 安装向导会自动检测并处理：
+
+   - 未安装：选择仓库后立即自动创建插件目录并安装。
+   - 已安装：显示现有版本，并允许更新或重新安装。
+   - 安装不完整：允许修复安装。
+
+5. 如果已安装或安装不完整，点击“更新/重装”或“修复安装”；未安装时直接等待完成提示。
+6. 重新加载 Obsidian，在“设置 → 第三方插件”中启用 **Pdf translate to markdown**。
+
+安装向导会从本仓库的最新正式 Release 下载 `main.js`、`manifest.json` 和 `styles.css`，校验插件 ID 与版本后再写入。更新时不会删除 `data.json`，因此现有插件设置和 API 密钥不会被覆盖；写入失败时会尝试恢复原文件。
+
+安装器目前仅支持 Windows，且暂未进行商业代码签名。Windows SmartScreen 可能显示未知发布者警告；可以先在本仓库查看 `installer/Installer.cs` 源码，再决定是否运行。
+
+### 手动安装
 
 1. 打开 [Releases](https://github.com/zhao0511/pdf-translate-to-markdown/releases)。
 2. 下载最新 Release 中的 `main.js`、`manifest.json` 和 `styles.css`。
@@ -157,3 +176,11 @@ npm test
 ```
 
 源码位于 `src/`。测试覆盖 Mistral 上传/OCR/远程清理、公式修正、附件防重名、PDF 完整流程，以及 GitHub Release 版本比较、资源校验和更新写入。
+
+Windows 安装向导源码位于 `installer/Installer.cs`。在带有 .NET Framework C# 编译器的 Windows 环境中运行以下命令构建：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File installer/build.ps1
+```
+
+构建产物为 `installer/bin/PdfTranslateToMarkdown-Setup.exe`。可使用 `--self-test` 参数运行不联网的路径与 manifest 校验自检。
