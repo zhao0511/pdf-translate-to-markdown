@@ -3,6 +3,12 @@ import { MistralOcrService } from "../src/mistral-ocr-service.mjs";
 
 const calls = [];
 const client = {
+  models: {
+    async list() {
+      calls.push(["models-list"]);
+      return { data: [{ id: "mistral-ocr-latest" }] };
+    },
+  },
   files: {
     async upload(input) {
       calls.push(["upload", input]);
@@ -57,5 +63,8 @@ assert.equal(ocrInput.includeImageBase64, true);
 assert.equal(ocrInput.imageLimit, undefined);
 assert.equal(ocrInput.imageMinSize, 16);
 assert.equal(ocrInput.includeBlocks, false);
+
+assert.equal(await service.checkConnection(), true);
+assert.equal(calls.at(-1)[0], "models-list");
 
 console.log("Mistral service test passed");

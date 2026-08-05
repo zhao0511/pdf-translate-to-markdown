@@ -4,3 +4,219 @@
   resize: vertical;
   font-family: var(--font-monospace);
 }
+
+.modal.pdf-translate-range-modal {
+  width: 96vw;
+  max-width: 1600px;
+  height: 94vh;
+  max-height: 94vh;
+}
+
+.pdf-translate-range-modal .modal-content {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.pdf-translate-range-layout {
+  display: grid;
+  min-height: 0;
+  flex: 1 1 auto;
+  grid-template-columns: minmax(0, 1fr) minmax(340px, 420px);
+  gap: 1rem;
+}
+
+.pdf-translate-range-preview {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  background: var(--background-secondary);
+}
+
+.pdf-translate-range-preview iframe {
+  width: 100%;
+  min-height: 0;
+  flex: 1 1 auto;
+  border: 0;
+  background: white;
+}
+
+.pdf-translate-range-preview-fallback {
+  margin: 0;
+  padding: 0.45rem 0.7rem;
+  border-top: 1px solid var(--background-modifier-border);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+.pdf-translate-range-sidebar {
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  padding: 0.9rem;
+  overflow: hidden;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  background: var(--background-primary);
+}
+
+.pdf-translate-range-sidebar h3 {
+  margin: 0 0 0.7rem;
+}
+
+.pdf-translate-range-hints {
+  flex: 0 0 auto;
+  padding: 0.65rem 0.75rem;
+  border-left: 3px solid var(--color-orange);
+  border-radius: var(--radius-s);
+  background: var(--background-secondary);
+}
+
+.pdf-translate-range-hints p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  line-height: 1.45;
+}
+
+.pdf-translate-range-hints p + p {
+  margin-top: 0.45rem;
+}
+
+.pdf-translate-range-row-header,
+.pdf-translate-range-row {
+  display: grid;
+  grid-template-columns: 5.25rem 1rem 5.25rem 3.5rem;
+  gap: 0.35rem;
+  align-items: center;
+  justify-content: start;
+}
+
+.pdf-translate-range-row-header {
+  flex: 0 0 auto;
+  padding: 0.75rem 0.25rem 0.35rem;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  text-align: center;
+}
+
+.pdf-translate-range-rows {
+  min-height: 5rem;
+  flex: 1 1 auto;
+  padding: 0.15rem 0.25rem 0.5rem;
+  overflow-y: auto;
+}
+
+.pdf-translate-range-row {
+  padding: 0.45rem;
+  border-radius: var(--radius-s);
+  transition: opacity 120ms ease, background-color 120ms ease;
+}
+
+.pdf-translate-range-row + .pdf-translate-range-row {
+  margin-top: 0.2rem;
+}
+
+.pdf-translate-range-row:hover {
+  background: var(--background-secondary);
+}
+
+.pdf-translate-range-row.is-pending {
+  opacity: 0.48;
+  background: var(--background-secondary-alt);
+}
+
+.pdf-translate-range-row.is-pending:focus-within {
+  opacity: 0.82;
+}
+
+.pdf-translate-range-row.is-autofilled {
+  background: var(--background-secondary);
+}
+
+.pdf-translate-range-number {
+  width: 100%;
+  min-width: 0;
+  height: 2.25rem;
+  padding-inline: 0.45rem;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.pdf-translate-range-separator {
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.pdf-translate-range-delete {
+  min-width: 0;
+  padding-inline: 0.45rem;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+.pdf-translate-range-delete:hover {
+  color: var(--text-error);
+}
+
+.pdf-translate-range-status {
+  flex: 0 0 auto;
+  min-height: 2.8rem;
+  padding: 0.65rem 0.8rem;
+  border-top: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  background: var(--background-secondary);
+}
+
+.pdf-translate-range-status.is-valid {
+  color: var(--text-success);
+}
+
+.pdf-translate-range-status.is-error {
+  color: var(--text-error);
+}
+
+.pdf-translate-range-buttons {
+  display: flex;
+  flex: 0 0 auto;
+  justify-content: flex-end;
+  gap: 0.6rem;
+  padding-top: 0.75rem;
+}
+
+.pdf-translate-failure-modal .modal-content p {
+  margin-block: 0 0.75rem;
+}
+
+.pdf-translate-failure-warning {
+  color: var(--text-warning);
+}
+
+.pdf-translate-failure-modal details {
+  margin: 0.75rem 0;
+  max-height: 14rem;
+  overflow: auto;
+}
+
+.pdf-translate-failure-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.75rem;
+  margin-top: 1rem;
+}
+
+@media (max-width: 900px) {
+  .modal.pdf-translate-range-modal {
+    width: 96vw;
+  }
+
+  .pdf-translate-range-layout {
+    grid-template-columns: minmax(0, 1fr) minmax(300px, 38vw);
+  }
+}

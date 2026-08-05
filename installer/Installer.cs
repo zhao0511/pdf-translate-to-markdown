@@ -12,8 +12,8 @@ using System.Windows.Forms;
 [assembly: System.Reflection.AssemblyDescription("Installer for the Pdf translate to markdown Obsidian plugin")]
 [assembly: System.Reflection.AssemblyCompany("zhao0511")]
 [assembly: System.Reflection.AssemblyProduct("Pdf translate to markdown")]
-[assembly: System.Reflection.AssemblyVersion("0.6.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("0.6.0.0")]
+[assembly: System.Reflection.AssemblyVersion("0.7.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("0.7.0.0")]
 
 namespace PdfTranslateToMarkdownSetup
 {
@@ -182,7 +182,7 @@ namespace PdfTranslateToMarkdownSetup
             using (var client = new WebClient())
             {
                 client.Headers[HttpRequestHeader.UserAgent] =
-                    "PdfTranslateToMarkdown-Setup/0.6.0";
+                    "PdfTranslateToMarkdown-Setup/0.7.0";
                 client.Headers[HttpRequestHeader.Accept] = "application/octet-stream";
                 return await client.DownloadDataTaskAsync(uri);
             }

@@ -1,5 +1,6 @@
 export const DEEPSEEK_SECRET_ID = "deepseek-translator-deepseek-api-key";
 export const MISTRAL_SECRET_ID = "deepseek-translator-mistral-api-key";
+export const MINERU_SECRET_ID = "deepseek-translator-mineru-api-key";
 
 export const DEFAULT_SETTINGS = {
   apiKey: "",
@@ -13,6 +14,16 @@ export const DEFAULT_SETTINGS = {
 
   mistralApiKey: "",
   mistralModel: "mistral-ocr-latest",
+  ocrProvider: "mistral",
+  mineruApiKey: "",
+  mineruBaseUrl: "https://mineru.net/api/v4",
+  mineruModelVersion: "vlm",
+  mineruLanguage: "en",
+  mineruForceOcr: false,
+  mineruEnableFormula: true,
+  mineruEnableTable: true,
+  mineruPollIntervalSeconds: 3,
+  mineruTimeoutMinutes: 30,
   pdfOutputMode: "same-folder",
   movePdfToSubfolder: false,
   keepOcrMarkdown: false,
@@ -21,6 +32,7 @@ export const DEFAULT_SETTINGS = {
   imageMinSize: 0,
   paginate: true,
   deleteMistralFile: true,
+  debugMode: false,
 
   translationPrompt: `下面请把我提供的 Markdown 文档翻译成简体中文。
 

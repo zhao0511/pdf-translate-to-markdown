@@ -1,4 +1,5 @@
 node_modules/
 main.js.map
 data.json
+debug-last-task.json
 installer/bin/

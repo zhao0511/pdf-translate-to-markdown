@@ -4,55 +4,28 @@ export class MistralOcrService {
   constructor(settings, clientFactory = (apiKey) => new Mistral({ apiKey })) {
     this.settings = settings;
     this.clientFactory = clientFactory;
+    this.providerId = "mistral";
+    this.providerName = "Mistral";
+    this.supportsRemoteDelete = true;
   }
 
   async processPdf(arrayBuffer, fileName, callbacks = {}) {
-    const client = this.clientFactory(this.settings.mistralApiKey.trim());
     let uploadedFileId;
 
     try {
       callbacks.onStage?.(2, "上传至 Mistral");
-      const upload = await client.files.upload({
-        file: this.createUploadFile(arrayBuffer, fileName),
-        purpose: "ocr",
-      });
-
-      if (!upload?.id) {
-        throw new Error("Mistral 没有返回上传文件 ID");
-      }
-      uploadedFileId = upload.id;
-
-      const signedUrl = await client.files.getSignedUrl({
-        fileId: uploadedFileId,
-        expiry: 1,
-      });
-      if (!signedUrl?.url) {
-        throw new Error("Mistral 没有返回文件签名地址");
-      }
+      const uploaded = await this.uploadPdf(arrayBuffer, fileName);
+      uploadedFileId = uploaded.fileId;
 
       callbacks.onStage?.(3, "Mistral OCR 中");
-      const imageLimit = this.positiveIntegerOrUndefined(this.settings.imageLimit);
-      const imageMinSize = this.positiveIntegerOrUndefined(this.settings.imageMinSize);
-      const response = await client.ocr.process({
-        model: this.settings.mistralModel.trim() || "mistral-ocr-latest",
-        document: {
-          type: "document_url",
-          documentUrl: signedUrl.url,
-        },
-        includeImageBase64: Boolean(this.settings.extractImages),
-        imageLimit,
-        imageMinSize,
-        includeBlocks: false,
-      });
-
-      if (!Array.isArray(response?.pages) || response.pages.length === 0) {
-        throw new Error("Mistral OCR 没有返回页面内容");
-      }
-      return response;
+      return await this.processOcr(uploaded.url);
+    } catch (error) {
+      uploadedFileId = uploadedFileId || error?.uploadedFileId;
+      throw error;
     } finally {
       if (this.settings.deleteMistralFile && uploadedFileId) {
         try {
-          const deletion = await client.files.delete({ fileId: uploadedFileId });
+          const deletion = await this.deleteFile(uploadedFileId);
           if (!deletion?.deleted) {
             callbacks.onWarning?.("Mistral 返回了未删除状态，远程临时文件可能仍然存在。");
           }
@@ -61,6 +34,88 @@ export class MistralOcrService {
         }
       }
     }
+  }
+
+  async uploadPdf(arrayBuffer, fileName) {
+    const client = this.createClient();
+    let uploadedFileId;
+    try {
+      const upload = await client.files.upload({
+        file: this.createUploadFile(arrayBuffer, fileName),
+        purpose: "ocr",
+      });
+      if (!upload?.id) {
+        throw new Error("Mistral 没有返回上传文件 ID");
+      }
+      uploadedFileId = upload.id;
+      const url = await this.getSignedUrl(uploadedFileId, client);
+      return { fileId: uploadedFileId, url };
+    } catch (error) {
+      const wrapped = new Error(this.errorMessage(error));
+      wrapped.cause = error;
+      wrapped.uploadedFileId = uploadedFileId;
+      throw wrapped;
+    }
+  }
+
+  async getSignedUrl(fileId, existingClient = null) {
+    const client = existingClient || this.createClient();
+    const signedUrl = await client.files.getSignedUrl({
+      fileId,
+      expiry: 1,
+    });
+    if (!signedUrl?.url) {
+      throw new Error("Mistral 没有返回文件签名地址");
+    }
+    return signedUrl.url;
+  }
+
+  async processOcr(documentUrl) {
+    const client = this.createClient();
+    const imageLimit = this.positiveIntegerOrUndefined(this.settings.imageLimit);
+    const imageMinSize = this.positiveIntegerOrUndefined(this.settings.imageMinSize);
+    const response = await client.ocr.process({
+      model: this.settings.mistralModel.trim() || "mistral-ocr-latest",
+      document: {
+        type: "document_url",
+        documentUrl,
+      },
+      includeImageBase64: Boolean(this.settings.extractImages),
+      imageLimit,
+      imageMinSize,
+      includeBlocks: false,
+    });
+    if (!Array.isArray(response?.pages) || response.pages.length === 0) {
+      throw new Error("Mistral OCR 没有返回页面内容");
+    }
+    return response;
+  }
+
+  async deleteFile(fileId) {
+    return this.createClient().files.delete({ fileId });
+  }
+
+  async checkConnection() {
+    const response = await this.createClient().models.list();
+    if (!response || !Array.isArray(response.data)) {
+      throw new Error("Mistral 模型列表响应无效");
+    }
+    const configuredModel = this.settings.mistralModel.trim() || "mistral-ocr-latest";
+    if (
+      response.data.length > 0 &&
+      !response.data.some(
+        (model) =>
+          model?.id === configuredModel ||
+          (Array.isArray(model?.aliases) && model.aliases.includes(configuredModel)),
+      )
+    ) {
+      throw new Error(`Mistral 当前账户不可用模型：${configuredModel}`);
+    }
+    return true;
+  }
+
+  createClient() {
+    return this.clientFactory(this.settings.mistralApiKey.trim());
   }
 
   createUploadFile(arrayBuffer, fileName) {

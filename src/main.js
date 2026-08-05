@@ -13,6 +13,7 @@ import {
 import {
   DEEPSEEK_SECRET_ID,
   DEFAULT_SETTINGS,
+  MINERU_SECRET_ID,
   MISTRAL_SECRET_ID,
 } from "./defaults.js";
 import {
@@ -24,8 +25,19 @@ import {
   stripDataUrlPrefix,
 } from "./markdown-utils.js";
 import { MistralOcrService } from "./mistral-ocr-service.mjs";
+import { MinerUOcrService } from "./mineru-ocr-service.mjs";
+import { PdfDocumentService } from "./pdf-document-service.mjs";
+import { PdfRangeModal } from "./pdf-range-modal.js";
+import {
+  PDF_SPLIT_THRESHOLD,
+  countSelectedPages,
+  mergeMarkdownParts,
+} from "./pdf-range-utils.mjs";
 import { TaskProgress } from "./task-progress.js";
+import { TaskFailureModal } from "./task-failure-modal.js";
 import { GithubReleaseService, isVersionNewer } from "./update-service.mjs";
+
+const MAX_STAGE_ATTEMPTS = 3;
 
 class DeepSeekTranslatorPlugin extends Plugin {
   async onload() {
@@ -110,6 +122,14 @@ class DeepSeekTranslatorPlugin extends Plugin {
       shouldMigrate = true;
     }
 
+    const mineruSecret = secretStorage.getSecret(MINERU_SECRET_ID);
+    if (mineruSecret) {
+      this.settings.mineruApiKey = mineruSecret;
+    } else if (saved.mineruApiKey) {
+      secretStorage.setSecret(MINERU_SECRET_ID, saved.mineruApiKey);
+      shouldMigrate = true;
+    }
+
     if (shouldMigrate) {
       await this.saveSettings();
     }
@@ -122,8 +142,10 @@ class DeepSeekTranslatorPlugin extends Plugin {
     if (secretStorage) {
       secretStorage.setSecret(DEEPSEEK_SECRET_ID, this.settings.apiKey || "");
       secretStorage.setSecret(MISTRAL_SECRET_ID, this.settings.mistralApiKey || "");
+      secretStorage.setSecret(MINERU_SECRET_ID, this.settings.mineruApiKey || "");
       saved.apiKey = "";
       saved.mistralApiKey = "";
+      saved.mineruApiKey = "";
     }
 
     await this.saveData(saved);
@@ -138,20 +160,54 @@ class DeepSeekTranslatorPlugin extends Plugin {
     }
 
     const progress = this.createProgress(file.name, 3, "翻译");
+    const debugSession = this.createDebugSession("markdown", file);
     try {
       progress.setPhase(1, "读取 Markdown");
       const markdown = await this.app.vault.cachedRead(file);
       const prepared = this.prepareMarkdownForTranslation(markdown);
+      await this.updateDebugSession(debugSession, "markdown-prepared", {
+        sourceMarkdown: markdown,
+        preparedMarkdown: prepared.markdown,
+        mathReplacementCount: prepared.replacementCount,
+      });
 
       progress.setPhase(2, "DeepSeek 翻译中");
-      const translated = await this.requestTranslation(prepared.markdown);
+      const translatedResponse = await this.runStageWithRetries(
+        "翻译",
+        (attempt) =>
+          this.requestTranslation(prepared.markdown, {
+            onResponse: (response) =>
+              this.updateDebugSession(debugSession, "translation-response", {
+                attempt,
+                response,
+              }),
+          }),
+        (label) => progress.update(label),
+        {
+          onAttemptFailure: (attempt, error) =>
+            this.updateDebugSession(debugSession, "translation-attempt-failed", {
+              attempt,
+              error: this.serializeError(error),
+            }),
+        },
+      );
+      const translated = normalizeMistralMath(translatedResponse);
+      await this.updateDebugSession(debugSession, "translation-normalized", {
+        translatedMarkdown: translated.markdown,
+        mathReplacementCount: translated.replacementCount,
+      });
       progress.setPhase(3, "保存译文");
       const outputPath = this.getAvailableMarkdownTranslationPath(file);
-      const outputFile = await this.app.vault.create(outputPath, translated);
+      const outputFile = await this.app.vault.create(outputPath, translated.markdown);
       await this.openFileSafely(outputFile);
+      await this.updateDebugSession(debugSession, "output-saved", {
+        translationPath: outputFile.path,
+      });
       progress.complete(`翻译完成：${outputFile.path}`);
+      await this.finishDebugSession(debugSession, "completed");
     } catch (error) {
       console.error("Pdf translate to markdown:", error);
+      await this.finishDebugSession(debugSession, "failed", error);
       progress.fail(this.getErrorMessage(error));
     } finally {
       this.finishFileTask(file, progress);
@@ -160,42 +216,130 @@ class DeepSeekTranslatorPlugin extends Plugin {
   }
 
   async translatePdf(file) {
-    if (!this.requireMistralKey() || !this.requireDeepSeekKey()) {
+    if (!this.requireOcrProviderKey() || !this.requireDeepSeekKey()) {
       return;
     }
     if (!this.startFileTask(file)) {
       return;
     }
 
-    const progress = this.createProgress(file.name, 7, "PDF 一键处理");
+    const progress = this.createProgress(file.name, 8, "PDF 一键处理");
+    const debugSession = this.createDebugSession("pdf", file);
     try {
-      progress.setPhase(1, "读取 PDF");
+      progress.setPhase(1, "检查 API 连接");
+      const connected = await this.ensurePdfApiConnections(progress, debugSession);
+      if (!connected) {
+        await this.finishDebugSession(debugSession, "abandoned");
+        return;
+      }
+
+      progress.setPhase(2, "读取 PDF");
       const pdfBytes = await this.app.vault.readBinary(file);
       const pdfHash = await shortContentHash(pdfBytes);
-      const outputPlan = this.getAvailablePdfOutputPlan(file);
-
-      const mistral = this.createMistralService();
-      const ocrResponse = await mistral.processPdf(pdfBytes, file.name, {
-        onStage: (phase, label) => progress.setPhase(phase, label),
-        onWarning: (message) => {
-          console.warn("Pdf translate to markdown:", message);
-          new Notice(message, 10000);
-        },
+      const pdfDocument = this.createPdfDocumentService();
+      const pageCount = await pdfDocument.load(pdfBytes);
+      await this.updateDebugSession(debugSession, "pdf-loaded", {
+        pageCount,
+        pdfHash,
       });
 
-      progress.setPhase(4, "保存 OCR 图片");
-      await this.ensureOutputFolder(outputPlan.outputFolder);
-      const materialized = await this.materializeOcrResult(
-        ocrResponse.pages,
-        file,
-        outputPlan,
-        pdfHash,
-        progress,
-      );
+      let ranges = [{ start: 1, end: pageCount }];
+      if (pageCount > PDF_SPLIT_THRESHOLD) {
+        progress.setPhase(3, "等待选择翻译页码");
+        ranges = await this.choosePdfRanges(file, pageCount);
+        if (!ranges) {
+          await this.finishDebugSession(debugSession, "cancelled");
+          new Notice("已取消 PDF 翻译。", 4000);
+          return;
+        }
+      }
 
-      const normalized = normalizeMistralMath(materialized.markdown);
-      const ocrMarkdown = normalized.markdown;
-      const translationInput = normalized.markdown;
+      const outputPlan = this.getAvailablePdfOutputPlan(file);
+      await this.ensureOutputFolder(outputPlan.outputFolder);
+
+      progress.setPhase(2, ranges.length > 1 ? `准备 ${ranges.length} 个 PDF 分段` : "准备 PDF");
+      const segments = await pdfDocument.createSegments(ranges);
+      const states = segments.map((segment, index) =>
+        this.createPdfSegmentState(segment, index, file),
+      );
+      await this.initializeDebugSegments(debugSession, states, ranges);
+      const updateAggregateProgress = (retryLabel = "") => {
+        const uploaded = states.filter((state) => state.uploaded).length;
+        const ocrDone = states.filter((state) => state.ocrDone).length;
+        const translationDone = states.filter((state) => state.translationDone).length;
+        progress.update(
+          `上传 ${uploaded}/${states.length}｜OCR ${ocrDone}/${states.length}｜翻译 ${translationDone}/${states.length}${
+            retryLabel ? `｜${retryLabel}` : ""
+          }`,
+        );
+      };
+
+      progress.setPhase(
+        3,
+        `上传 0/${states.length}｜OCR 0/${states.length}｜翻译 0/${states.length}`,
+      );
+      updateAggregateProgress();
+      let abandoned = false;
+      while (states.some((state) => !state.translationDone)) {
+        for (const state of states) {
+          state.failure = null;
+        }
+        const failures = await this.processPdfAttempt({
+          states,
+          file,
+          outputPlan,
+          pdfHash,
+          updateProgress: updateAggregateProgress,
+          debugSession,
+        });
+        if (failures.length === 0) {
+          break;
+        }
+
+        updateAggregateProgress("等待选择");
+        const action = await this.askPdfFailureAction(states, failures);
+        if (action === "retry") {
+          await this.updateDebugSession(debugSession, "user-retry", {
+            failedSegments: failures.map(({ state }) => state.index + 1),
+          });
+          updateAggregateProgress("正在重试");
+          continue;
+        }
+
+        abandoned = true;
+        updateAggregateProgress("正在清理");
+        const cleanup = await this.cleanupPdfSegmentStates(states, {
+          forceRemoteDelete: true,
+        });
+        await this.updateDebugSession(debugSession, "user-abandon", { cleanup });
+        new Notice(
+          cleanup.failed === 0
+            ? "已放弃 PDF 处理，并清理本次任务的中间结果。"
+            : `已放弃 PDF 处理，但有 ${cleanup.failed} 项中间结果清理失败，请查看控制台。`,
+          cleanup.failed === 0 ? 6000 : 12000,
+        );
+        break;
+      }
+      if (abandoned) {
+        await this.finishDebugSession(debugSession, "abandoned");
+        return;
+      }
+      const results = states.map((state) => ({
+        ocrMarkdown: state.ocrMarkdown,
+        translated: state.translated,
+        savedImageCount: state.imageLinks.size,
+      }));
+
+      progress.setPhase(4, "合并分块结果");
+      const ocrSeparator =
+        this.settings.ocrProvider !== "mineru" && this.settings.paginate
+          ? "\n\n---\n\n"
+          : "\n\n";
+      const ocrMarkdown = mergeMarkdownParts(
+        results.map((result) => result.ocrMarkdown),
+        ocrSeparator,
+      );
+      const translated = mergeMarkdownParts(results.map((result) => result.translated));
 
       progress.setPhase(5, "保存 OCR Markdown");
       let ocrFile = null;
@@ -205,22 +349,32 @@ class DeepSeekTranslatorPlugin extends Plugin {
         progress.update("跳过 OCR Markdown");
       }
 
-      progress.setPhase(6, "DeepSeek 翻译中");
-      const translated = await this.requestTranslation(translationInput);
-
-      progress.setPhase(7, "保存译文");
+      progress.setPhase(6, "保存译文");
       const translatedFile = await this.app.vault.create(outputPlan.translationPath, translated);
+      progress.setPhase(7, "完成输出");
       await this.movePdfIfRequested(file, outputPlan);
       await this.openFileSafely(translatedFile);
+      await this.updateDebugSession(debugSession, "output-saved", {
+        ocrPath: ocrFile?.path || null,
+        translationPath: translatedFile.path,
+      });
 
+      const selectedPages = countSelectedPages(ranges);
+      const savedImageCount = results.reduce(
+        (total, result) => total + result.savedImageCount,
+        0,
+      );
       const details = [
-        `${ocrResponse.pages.length} 页`,
-        `${materialized.savedImageCount} 张图片`,
+        `${selectedPages}/${pageCount} 页`,
+        `${ranges.length} 个部分`,
+        `${savedImageCount} 张图片`,
         ocrFile ? `OCR：${ocrFile.path}` : "未保留 OCR 文件",
       ].join("；");
       progress.complete(`PDF 翻译完成：${translatedFile.path}（${details}）`);
+      await this.finishDebugSession(debugSession, "completed");
     } catch (error) {
       console.error("Pdf translate to markdown PDF pipeline:", error);
+      await this.finishDebugSession(debugSession, "failed", error);
       progress.fail(this.getErrorMessage(error));
     } finally {
       this.finishFileTask(file, progress);
@@ -310,6 +464,695 @@ class DeepSeekTranslatorPlugin extends Plugin {
     return new MistralOcrService(this.settings);
   }
 
+  createMinerUService() {
+    return new MinerUOcrService(this.settings, requestUrl);
+  }
+
+  createOcrService() {
+    return this.settings.ocrProvider === "mineru"
+      ? this.createMinerUService()
+      : this.createMistralService();
+  }
+
+  ocrProviderName() {
+    return this.settings.ocrProvider === "mineru" ? "MinerU" : "Mistral";
+  }
+
+  createPdfDocumentService() {
+    return new PdfDocumentService();
+  }
+
+  choosePdfRanges(file, pageCount) {
+    return new PdfRangeModal(this.app, file, pageCount).waitForResult();
+  }
+
+  createPdfSegmentState(segment, index, file) {
+    const segmentName = segment.isWholeDocument
+      ? file.name
+      : `${sanitizePathSegment(file.basename, "PDF")}--p${String(segment.start).padStart(
+          4,
+          "0",
+        )}-${String(segment.end).padStart(4, "0")}.pdf`;
+    return {
+      segment,
+      index,
+      segmentName,
+      ocrProvider: this.settings.ocrProvider === "mineru" ? "mineru" : "mistral",
+      ocrService: this.createOcrService(),
+      uploaded: false,
+      remoteFileId: null,
+      remoteDeleted: false,
+      remoteFileIds: new Set(),
+      deletedRemoteFileIds: new Set(),
+      signedUrl: null,
+      ocrResponse: null,
+      ocrMarkdown: null,
+      ocrDone: false,
+      imageLinks: new Map(),
+      createdImagePaths: new Set(),
+      translated: null,
+      translationDone: false,
+      failure: null,
+    };
+  }
+
+  async processPdfAttempt({
+    states,
+    file,
+    outputPlan,
+    pdfHash,
+    updateProgress,
+    debugSession,
+  }) {
+    const stages = [
+      {
+        pending: (state) => !state.uploaded,
+        run: (state) => this.uploadPdfSegment(state, updateProgress, debugSession),
+      },
+      {
+        pending: (state) => !state.ocrDone,
+        run: (state) =>
+          this.ocrPdfSegment(
+            state,
+            file,
+            outputPlan,
+            pdfHash,
+            updateProgress,
+            debugSession,
+          ),
+      },
+      {
+        pending: (state) => !state.translationDone,
+        run: (state) => this.translatePdfSegment(state, updateProgress, debugSession),
+      },
+    ];
+
+    for (const stage of stages) {
+      const pendingStates = states.filter(stage.pending);
+      if (pendingStates.length === 0) {
+        continue;
+      }
+      const settled = await Promise.allSettled(
+        pendingStates.map(async (state) => {
+          try {
+            await stage.run(state);
+            state.failure = null;
+          } catch (error) {
+            state.failure = error;
+            throw error;
+          } finally {
+            updateProgress();
+          }
+        }),
+      );
+      const failures = settled
+        .map((result, index) => ({ result, state: pendingStates[index] }))
+        .filter(({ result }) => result.status === "rejected");
+      if (failures.length > 0) {
+        return failures;
+      }
+    }
+    return [];
+  }
+
+  async uploadPdfSegment(state, updateProgress, debugSession) {
+    const uploaded = await this.runStageWithRetries(
+      "上传",
+      async (attempt) => {
+        try {
+          const result = await state.ocrService.uploadPdf(
+            state.segment.arrayBuffer,
+            state.segmentName,
+          );
+          await this.recordDebugAttempt(debugSession, state, "upload", attempt, {
+            status: "success",
+            remoteFileId: result.fileId,
+          });
+          return result;
+        } catch (error) {
+          if (error?.uploadedFileId) {
+            state.remoteFileIds.add(error.uploadedFileId);
+            if (state.ocrService.supportsRemoteDelete !== false) {
+              const deleted = await this.deleteRemoteFileId(
+                state.ocrService,
+                error.uploadedFileId,
+              );
+              if (deleted) {
+                state.deletedRemoteFileIds.add(error.uploadedFileId);
+              }
+            }
+          }
+          throw error;
+        }
+      },
+      updateProgress,
+      {
+        onAttemptFailure: (attempt, error) =>
+          this.recordDebugAttempt(debugSession, state, "upload", attempt, {
+            status: "failed",
+            error: this.serializeError(error),
+          }),
+      },
+    );
+    state.remoteFileId = uploaded.fileId;
+    state.remoteFileIds.add(uploaded.fileId);
+    state.signedUrl = uploaded.url;
+    state.uploaded = true;
+    await this.updateDebugSegment(debugSession, state, {
+      uploaded: true,
+      remoteFileId: uploaded.fileId,
+    });
+    updateProgress();
+  }
+
+  async ocrPdfSegment(
+    state,
+    file,
+    outputPlan,
+    pdfHash,
+    updateProgress,
+    debugSession,
+  ) {
+    if (!state.ocrResponse) {
+      state.ocrResponse = await this.runStageWithRetries(
+        "OCR",
+        async (attempt) => {
+          if (attempt > 1 || !state.signedUrl) {
+            state.signedUrl = await state.ocrService.getSignedUrl(state.remoteFileId);
+          }
+          const response = await state.ocrService.processOcr(state.signedUrl, {
+            onProgress: (status) => {
+              const count =
+                status.extractedPages !== null && status.totalPages !== null
+                  ? ` ${status.extractedPages}/${status.totalPages}`
+                  : "";
+              updateProgress(`${this.ocrProviderName()} OCR${count}`);
+            },
+          });
+          const debugResponse = this.sanitizeOcrResponseForDebug(response);
+          await this.recordDebugAttempt(debugSession, state, "ocr-api", attempt, {
+            status: "received",
+            response: debugResponse,
+          });
+          this.validateOcrPageCount(response, state.segment, state.ocrProvider);
+          return response;
+        },
+        updateProgress,
+        {
+          onAttemptFailure: (attempt, error) =>
+            this.recordDebugAttempt(debugSession, state, "ocr-api", attempt, {
+              status: "failed",
+              error: this.serializeError(error),
+            }),
+        },
+      );
+    }
+
+    const materialized = await this.runStageWithRetries(
+      "OCR",
+      () =>
+        this.materializeOcrResult(
+          state.ocrResponse.pages,
+          file,
+          outputPlan,
+          pdfHash,
+          { update: () => updateProgress() },
+          {
+            pageNumberOffset: state.segment.start - 1,
+            existingImageLinks: state.imageLinks,
+            onImageSaved: ({ key, path, embeddedLink }) => {
+              state.imageLinks.set(key, { path, embeddedLink });
+              state.createdImagePaths.add(path);
+            },
+          },
+        ),
+      updateProgress,
+      {
+        onAttemptFailure: (attempt, error) =>
+          this.recordDebugAttempt(debugSession, state, "ocr-materialize", attempt, {
+            status: "failed",
+            error: this.serializeError(error),
+          }),
+      },
+    );
+    const normalized = normalizeMistralMath(materialized.markdown);
+    state.ocrMarkdown = normalized.markdown;
+    state.ocrDone = true;
+    await this.updateDebugSegment(debugSession, state, {
+      ocrDone: true,
+      ocrPageCount: Number.isFinite(state.ocrResponse.pageCount)
+        ? state.ocrResponse.pageCount
+        : state.ocrResponse.pages.length,
+      ocrMarkdown: state.ocrMarkdown,
+      ocrMathReplacementCount: normalized.replacementCount,
+      imagePaths: [...state.createdImagePaths],
+    });
+    updateProgress();
+    if (this.settings.deleteMistralFile && state.ocrService.supportsRemoteDelete !== false) {
+      await this.tryDeleteRemoteFile(state);
+    }
+  }
+
+  async translatePdfSegment(state, updateProgress, debugSession) {
+    const translated = await this.runStageWithRetries(
+      "翻译",
+      (attempt) =>
+        this.requestTranslation(state.ocrMarkdown, {
+          onResponse: (response) =>
+            this.recordDebugAttempt(debugSession, state, "translation", attempt, {
+              status: response.finishReason === "stop" ? "success" : "incomplete",
+              response,
+            }),
+        }),
+      updateProgress,
+      {
+        onAttemptFailure: (attempt, error) =>
+          this.recordDebugAttempt(debugSession, state, "translation", attempt, {
+            status: "failed",
+            error: this.serializeError(error),
+          }),
+      },
+    );
+    const normalized = normalizeMistralMath(translated);
+    state.translated = normalized.markdown;
+    state.translationDone = true;
+    await this.updateDebugSegment(debugSession, state, {
+      translationDone: true,
+      translatedMarkdown: state.translated,
+      translatedMathReplacementCount: normalized.replacementCount,
+    });
+    updateProgress();
+  }
+
+  validateOcrPageCount(response, segment, provider = "mistral") {
+    const expected = segment.end - segment.start + 1;
+    const pages = Array.isArray(response?.pages) ? response.pages : [];
+    const actual = Number.isFinite(response?.pageCount) ? response.pageCount : pages.length;
+    const providerName = provider === "mineru" ? "MinerU" : "Mistral";
+    if (actual !== expected) {
+      throw new Error(`${providerName} OCR 返回页数不完整：应为 ${expected} 页，实际为 ${actual} 页`);
+    }
+    const indices = pages.map((page) => page.index);
+    if (
+      !Number.isFinite(response?.pageCount) &&
+      indices.every(Number.isFinite) &&
+      indices.some((pageIndex, position) => pageIndex !== position)
+    ) {
+      throw new Error(`${providerName} OCR 返回的页面索引不连续`);
+    }
+  }
+
+  async runStageWithRetries(stageName, operation, updateProgress, options = {}) {
+    let lastError;
+    for (let attempt = 1; attempt <= MAX_STAGE_ATTEMPTS; attempt += 1) {
+      try {
+        return await operation(attempt);
+      } catch (error) {
+        lastError = error;
+        await options.onAttemptFailure?.(attempt, error);
+        if (attempt >= MAX_STAGE_ATTEMPTS) {
+          break;
+        }
+        updateProgress(`${stageName}自动重试 ${attempt + 1}/${MAX_STAGE_ATTEMPTS}`);
+        await this.waitBeforeRetry(attempt);
+      }
+    }
+    throw new Error(
+      `${stageName}连续 ${MAX_STAGE_ATTEMPTS} 次失败：${this.getErrorMessage(lastError)}`,
+      { cause: lastError },
+    );
+  }
+
+  waitBeforeRetry(attempt) {
+    return new Promise((resolve) => globalThis.setTimeout(resolve, attempt * 750));
+  }
+
+  async ensurePdfApiConnections(progress, debugSession) {
+    while (true) {
+      const providerName = this.ocrProviderName();
+      progress.update(`检查 DeepSeek 和 ${providerName} API 连接`);
+      const ocrService = this.createOcrService();
+      const checks = await Promise.allSettled([
+        this.runStageWithRetries(
+          "DeepSeek 连接检查",
+          () => this.checkDeepSeekConnection(),
+          (label) => progress.update(`检查 API 连接｜${label}`),
+        ),
+        this.runStageWithRetries(
+          `${providerName} 连接检查`,
+          () => ocrService.checkConnection(),
+          (label) => progress.update(`检查 API 连接｜${label}`),
+        ),
+      ]);
+      const services = ["DeepSeek", providerName];
+      const results = checks.map((result, index) => ({
+        service: services[index],
+        status: result.status,
+        error:
+          result.status === "rejected" ? this.serializeError(result.reason) : null,
+      }));
+      await this.updateDebugSession(debugSession, "api-preflight", { results });
+      const failures = results.filter((result) => result.status === "rejected");
+      if (failures.length === 0) {
+        progress.update("API 连接正常");
+        return true;
+      }
+
+      const action = await this.askApiConnectionFailureAction(failures);
+      if (action !== "retry") {
+        new Notice("已取消 PDF 处理，尚未上传任何文件。", 6000);
+        return false;
+      }
+      await this.updateDebugSession(debugSession, "api-preflight-user-retry");
+    }
+  }
+
+  askApiConnectionFailureAction(failures) {
+    return new TaskFailureModal(
+      this.app,
+      `任务尚未开始，${failures.map((failure) => failure.service).join("、")} API 连接检查失败。`,
+      failures.map(
+        (failure) => `${failure.service}：${failure.error?.message || "未知错误"}`,
+      ),
+      {
+        retryDescription: "重试会再次检查两个 API 的网络、密钥和模型可用性。",
+        abandonDescription:
+          "放弃会取消任务；此时尚未上传 PDF，也没有创建 OCR 图片。关闭此窗口也视为放弃。",
+      },
+    ).waitForResult();
+  }
+
+  askPdfFailureAction(states, failures) {
+    const uploaded = states.filter((state) => state.uploaded).length;
+    const ocrDone = states.filter((state) => state.ocrDone).length;
+    const translationDone = states.filter((state) => state.translationDone).length;
+    const summary = `上传 ${uploaded}/${states.length}｜OCR ${ocrDone}/${states.length}｜翻译 ${translationDone}/${states.length}。自动重试后仍有 ${failures.length} 个分块未完成。`;
+    const details = failures.map(({ result, state }) =>
+      `第 ${state.index + 1} 部分（${state.segment.start}-${state.segment.end} 页）：${this.getErrorMessage(result.reason)}`,
+    );
+    const isMinerU = this.settings.ocrProvider === "mineru";
+    return new TaskFailureModal(this.app, summary, details, {
+      abandonDescription: isMinerU
+        ? "放弃会删除本次任务创建的本地图片。MinerU 未提供任务删除接口，已经提交的远程解析任务无法由插件主动删除；关闭此窗口也视为放弃。"
+        : "放弃会删除本次任务创建的图片，并清理尚存的 Mistral 临时文件。关闭此窗口也视为放弃。",
+    }).waitForResult();
+  }
+
+  async tryDeleteRemoteFile(state) {
+    if (!state.remoteFileId || state.remoteDeleted) {
+      return;
+    }
+    try {
+      await this.runStageWithRetries(
+        "清理 Mistral 临时文件",
+        async () => {
+          const deletion = await state.ocrService.deleteFile(state.remoteFileId);
+          if (!deletion?.deleted) {
+            throw new Error("Mistral 返回了未删除状态");
+          }
+          return deletion;
+        },
+        () => {},
+      );
+      state.remoteDeleted = true;
+      state.deletedRemoteFileIds.add(state.remoteFileId);
+    } catch (error) {
+      console.warn("Unable to delete Mistral temporary file:", error);
+      new Notice(`无法删除 Mistral 远程临时文件：${this.getErrorMessage(error)}`, 10000);
+    }
+  }
+
+  async deleteRemoteFileId(mistral, fileId) {
+    try {
+      const deletion = await mistral.deleteFile(fileId);
+      return Boolean(deletion?.deleted);
+    } catch (error) {
+      console.warn("Unable to clean up a partially uploaded Mistral file:", error);
+      return false;
+    }
+  }
+
+  async cleanupPdfSegmentStates(states, options = {}) {
+    const forceRemoteDelete = Boolean(options.forceRemoteDelete);
+    const imagePaths = new Set(
+      states.flatMap((state) => [...state.createdImagePaths]),
+    );
+    const cleanupResults = await Promise.allSettled(
+      [...imagePaths].map(async (path) => {
+        const file = this.app.vault.getAbstractFileByPath(path);
+        if (file) {
+          await this.runStageWithRetries(
+            "清理 OCR 图片",
+            () => this.app.vault.delete(file, true),
+            () => {},
+          );
+        }
+      }),
+    );
+    for (const result of cleanupResults) {
+      if (result.status === "rejected") {
+        console.warn("Unable to delete an OCR image during cleanup:", result.reason);
+      }
+    }
+
+    if (forceRemoteDelete) {
+      const remoteResults = await Promise.allSettled(
+        states.flatMap((state) =>
+          state.ocrService.supportsRemoteDelete === false
+            ? []
+            : [...state.remoteFileIds]
+            .filter((fileId) => !state.deletedRemoteFileIds.has(fileId))
+            .map(async (fileId) => {
+              await this.runStageWithRetries(
+                "清理 Mistral 临时文件",
+                async () => {
+                  const deletion = await state.ocrService.deleteFile(fileId);
+                  if (!deletion?.deleted) {
+                    throw new Error("Mistral 返回了未删除状态");
+                  }
+                },
+                () => {},
+              );
+              state.deletedRemoteFileIds.add(fileId);
+              if (fileId === state.remoteFileId) {
+                state.remoteDeleted = true;
+              }
+            }),
+        ),
+      );
+      cleanupResults.push(...remoteResults);
+    }
+    return {
+      failed: cleanupResults.filter((result) => result.status === "rejected").length,
+    };
+  }
+
+  createDebugSession(taskType, file) {
+    if (!this.settings.debugMode || !this.app.vault.adapter?.write) {
+      return null;
+    }
+    const pluginDir = this.manifest.dir || `.obsidian/plugins/${this.manifest.id}`;
+    const session = {
+      path: normalizePath(`${pluginDir}/debug-last-task.json`),
+      schemaVersion: 1,
+      taskType,
+      taskId: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+      status: "running",
+      startedAt: new Date().toISOString(),
+      endedAt: null,
+      file: { path: file.path, name: file.name },
+      settings: {
+        deepSeekBaseUrl: this.settings.baseUrl,
+        deepSeekModel: this.settings.model,
+        thinkingEnabled: this.settings.thinkingEnabled,
+        reasoningEffort: this.settings.reasoningEffort,
+        maxTokens: this.settings.maxTokens,
+        ocrProvider: this.settings.ocrProvider,
+        mistralModel: this.settings.mistralModel,
+        mineruBaseUrl: this.settings.mineruBaseUrl,
+        mineruModelVersion: this.settings.mineruModelVersion,
+        mineruLanguage: this.settings.mineruLanguage,
+        mineruForceOcr: this.settings.mineruForceOcr,
+        mineruEnableFormula: this.settings.mineruEnableFormula,
+        mineruEnableTable: this.settings.mineruEnableTable,
+        extractImages: this.settings.extractImages,
+        paginate: this.settings.paginate,
+        translationPrompt: this.settings.translationPrompt,
+      },
+      metadata: {},
+      segments: [],
+      events: [],
+      writeQueue: Promise.resolve(),
+    };
+    void this.updateDebugSession(session, "task-started");
+    return session;
+  }
+
+  async initializeDebugSegments(session, states, ranges) {
+    if (!session) {
+      return;
+    }
+    session.metadata.ranges = ranges;
+    session.segments = states.map((state) => ({
+      index: state.index + 1,
+      range: { start: state.segment.start, end: state.segment.end },
+      segmentName: state.segmentName,
+      uploaded: false,
+      ocrDone: false,
+      translationDone: false,
+      attempts: [],
+    }));
+    await this.updateDebugSession(session, "segments-created", {
+      count: states.length,
+      ranges,
+    });
+  }
+
+  async updateDebugSegment(session, state, patch) {
+    if (!session) {
+      return;
+    }
+    const segment = session.segments[state.index];
+    if (!segment) {
+      return;
+    }
+    Object.assign(segment, patch);
+    await this.queueDebugWrite(session);
+  }
+
+  async recordDebugAttempt(session, state, stage, attempt, details) {
+    if (!session) {
+      return;
+    }
+    const segment = session.segments[state.index];
+    if (!segment) {
+      return;
+    }
+    segment.attempts.push({
+      timestamp: new Date().toISOString(),
+      stage,
+      attempt,
+      ...details,
+    });
+    await this.queueDebugWrite(session);
+  }
+
+  async updateDebugSession(session, eventType, data = null) {
+    if (!session) {
+      return;
+    }
+    if (data && eventType === "pdf-loaded") {
+      Object.assign(session.metadata, data);
+    }
+    session.events.push({
+      timestamp: new Date().toISOString(),
+      type: eventType,
+      data,
+    });
+    await this.queueDebugWrite(session);
+  }
+
+  async finishDebugSession(session, status, error = null) {
+    if (!session) {
+      return;
+    }
+    session.status = status;
+    session.endedAt = new Date().toISOString();
+    session.events.push({
+      timestamp: session.endedAt,
+      type: "task-finished",
+      data: error ? { error: this.serializeError(error) } : { status },
+    });
+    await this.queueDebugWrite(session);
+    await session.writeQueue;
+  }
+
+  queueDebugWrite(session) {
+    if (!session) {
+      return Promise.resolve();
+    }
+    const snapshot = JSON.stringify(
+      {
+        schemaVersion: session.schemaVersion,
+        taskType: session.taskType,
+        taskId: session.taskId,
+        status: session.status,
+        startedAt: session.startedAt,
+        endedAt: session.endedAt,
+        file: session.file,
+        settings: session.settings,
+        metadata: session.metadata,
+        segments: session.segments,
+        events: session.events,
+      },
+      null,
+      2,
+    );
+    session.writeQueue = session.writeQueue
+      .catch(() => {})
+      .then(() => this.app.vault.adapter.write(session.path, snapshot))
+      .catch((error) => {
+        console.warn("Unable to write debug snapshot:", error);
+      });
+    return session.writeQueue;
+  }
+
+  sanitizeOcrResponseForDebug(response) {
+    return {
+      provider: response?.provider || null,
+      pageCount: Number.isFinite(response?.pageCount)
+        ? response.pageCount
+        : Array.isArray(response?.pages)
+          ? response.pages.length
+          : 0,
+      pages: Array.isArray(response?.pages)
+        ? response.pages.map((page) => ({
+            index: page.index,
+            markdown: page.markdown || "",
+            images: (page.images || []).map((image) => ({
+              id: image.id || null,
+              topLeftX: image.topLeftX ?? null,
+              topLeftY: image.topLeftY ?? null,
+              bottomRightX: image.bottomRightX ?? null,
+              bottomRightY: image.bottomRightY ?? null,
+              pageIndex: image.pageIndex ?? null,
+              hasImageBase64: Boolean(image.imageBase64),
+            })),
+          }))
+        : [],
+    };
+  }
+
+  serializeError(error, depth = 0) {
+    const serialized = {
+      name: error instanceof Error ? error.name : "Error",
+      message: this.sanitizeDebugText(this.getErrorMessage(error)),
+    };
+    if (error instanceof Error && error.stack) {
+      serialized.stack = this.sanitizeDebugText(error.stack);
+    }
+    if (depth < 2 && error?.cause) {
+      serialized.cause = this.serializeError(error.cause, depth + 1);
+    }
+    return serialized;
+  }
+
+  sanitizeDebugText(value) {
+    let text = String(value || "");
+    for (const secret of [
+      this.settings.apiKey,
+      this.settings.mistralApiKey,
+      this.settings.mineruApiKey,
+    ]) {
+      if (secret) {
+        text = text.split(secret).join("[REDACTED_API_KEY]");
+      }
+    }
+    return text
+      .replace(/(authorization\s*:\s*bearer\s+)[^\s,;]+/gi, "$1[REDACTED]")
+      .replace(/(https?:\/\/[^\s?'\"<>]+)\?[^\s'\"<>]+/gi, "$1?[REDACTED]");
+  }
+
   createProgress(fileName, totalPhases, taskLabel) {
     const progress = new TaskProgress(fileName, totalPhases, taskLabel);
     this.activeProgress.add(progress);
@@ -347,11 +1190,25 @@ class DeepSeekTranslatorPlugin extends Plugin {
     return false;
   }
 
+  requireMinerUKey() {
+    if (this.settings.mineruApiKey.trim()) {
+      return true;
+    }
+    new Notice("请先在插件设置中填写 MinerU API Token。");
+    return false;
+  }
+
+  requireOcrProviderKey() {
+    return this.settings.ocrProvider === "mineru"
+      ? this.requireMinerUKey()
+      : this.requireMistralKey();
+  }
+
   prepareMarkdownForTranslation(markdown) {
     return normalizeMistralMath(markdown);
   }
 
-  async requestTranslation(markdown) {
+  async requestTranslation(markdown, options = {}) {
     const endpoint = this.getChatCompletionsEndpoint();
     const temperature = this.clampNumber(this.settings.temperature, 0, 2, 0.2);
     const maxTokens = Math.max(1, Math.floor(Number(this.settings.maxTokens) || 8192));
@@ -398,11 +1255,57 @@ class DeepSeekTranslatorPlugin extends Plugin {
       throw new Error(`DeepSeek API 返回 ${response.status}${apiMessage ? `：${apiMessage}` : ""}`);
     }
 
-    const content = response.json?.choices?.[0]?.message?.content;
+    const choice = response.json?.choices?.[0];
+    const content = choice?.message?.content;
+    const responseMetadata = {
+      id: response.json?.id || null,
+      model: response.json?.model || requestBody.model,
+      finishReason: choice?.finish_reason ?? null,
+      usage: response.json?.usage || null,
+      content: typeof content === "string" ? content : null,
+    };
+    await options.onResponse?.(responseMetadata);
     if (typeof content !== "string" || content.trim().length === 0) {
       throw new Error("DeepSeek API 没有返回可用的翻译文本");
     }
+    if (choice?.finish_reason !== "stop") {
+      const reason = choice?.finish_reason || "missing";
+      throw new Error(`DeepSeek 输出不完整（finish_reason=${reason}）`);
+    }
     return content;
+  }
+
+  async checkDeepSeekConnection() {
+    const response = await requestUrl({
+      url: `${this.getDeepSeekApiRoot()}/models`,
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${this.settings.apiKey.trim()}`,
+      },
+      throw: false,
+    });
+    if (response.status < 200 || response.status >= 300) {
+      const apiMessage = response.json?.error?.message || response.text;
+      throw new Error(
+        `DeepSeek API 连接失败（${response.status}）${apiMessage ? `：${apiMessage}` : ""}`,
+      );
+    }
+    const models = response.json?.data;
+    if (!Array.isArray(models)) {
+      throw new Error("DeepSeek 模型列表响应无效");
+    }
+    const configuredModel = this.settings.model.trim() || DEFAULT_SETTINGS.model;
+    if (models.length > 0 && !models.some((model) => model?.id === configuredModel)) {
+      throw new Error(`DeepSeek 当前账户不可用模型：${configuredModel}`);
+    }
+    return true;
+  }
+
+  getDeepSeekApiRoot() {
+    const baseUrl = (this.settings.baseUrl || DEFAULT_SETTINGS.baseUrl)
+      .trim()
+      .replace(/\/+$/, "");
+    return baseUrl.replace(/\/chat\/completions$/, "");
   }
 
   getChatCompletionsEndpoint() {
@@ -466,7 +1369,7 @@ class DeepSeekTranslatorPlugin extends Plugin {
     await this.app.vault.createFolder(folderPath);
   }
 
-  async materializeOcrResult(pages, pdfFile, outputPlan, pdfHash, progress) {
+  async materializeOcrResult(pages, pdfFile, outputPlan, pdfHash, progress, options = {}) {
     const referenceSourcePath = this.settings.keepOcrMarkdown
       ? outputPlan.ocrPath
       : outputPlan.translationPath;
@@ -478,10 +1381,14 @@ class DeepSeekTranslatorPlugin extends Plugin {
       : 0;
     const pageMarkdowns = [];
     let savedImageCount = 0;
+    const pageNumberOffset = Math.max(0, Math.floor(Number(options.pageNumberOffset) || 0));
+    const existingImageLinks =
+      options.existingImageLinks instanceof Map ? options.existingImageLinks : new Map();
 
     for (let pageOffset = 0; pageOffset < pages.length; pageOffset += 1) {
       const page = pages[pageOffset];
-      const pageNumber = Number.isFinite(page.index) ? page.index + 1 : pageOffset + 1;
+      const pageNumber =
+        pageNumberOffset + (Number.isFinite(page.index) ? page.index + 1 : pageOffset + 1);
       let markdown = page.markdown || "";
 
       if (this.settings.extractImages) {
@@ -493,10 +1400,29 @@ class DeepSeekTranslatorPlugin extends Plugin {
           }
 
           const originalId = String(image.id || `img-${imageOffset}.png`);
+          const imagePageNumber = Number.isFinite(image.pageIndex)
+            ? pageNumberOffset + image.pageIndex + 1
+            : pageNumber;
+          const imageKey = `${imagePageNumber}:${imageOffset}:${originalId}`;
+          const existing = existingImageLinks.get(imageKey);
+          if (existing && this.app.vault.getAbstractFileByPath(existing.path)) {
+            markdown = replaceMistralImagePlaceholder(
+              markdown,
+              originalId,
+              existing.embeddedLink,
+            );
+            savedImageCount += 1;
+            progress.update(`保存 OCR 图片 ${savedImageCount}/${imageCount}`);
+            continue;
+          }
+          if (existing) {
+            existingImageLinks.delete(imageKey);
+          }
+
           const fileName = this.uniqueImageName(
             pdfFile.basename,
             pdfHash,
-            pageNumber,
+            imagePageNumber,
             imageOffset,
             originalId,
             image.imageBase64,
@@ -518,6 +1444,11 @@ class DeepSeekTranslatorPlugin extends Plugin {
           if (!embeddedLink.startsWith("!")) {
             embeddedLink = `!${embeddedLink}`;
           }
+          options.onImageSaved?.({
+            key: imageKey,
+            path: imageFile.path,
+            embeddedLink,
+          });
           markdown = replaceMistralImagePlaceholder(markdown, originalId, embeddedLink);
 
           savedImageCount += 1;
@@ -563,7 +1494,7 @@ class DeepSeekTranslatorPlugin extends Plugin {
 
   async openFileSafely(file) {
     try {
-      await this.app.workspace.getLeaf(false).openFile(file);
+      await this.app.workspace.getLeaf("tab").openFile(file);
     } catch (error) {
       console.warn("Unable to open generated file:", error);
       new Notice(`文件已生成，但无法自动打开：${file.path}`, 8000);
@@ -624,7 +1555,7 @@ class DeepSeekTranslatorSettingTab extends PluginSettingTab {
     this.addExternalLink(
       mistralGuide,
       "API Keys",
-      "https://admin.mistral.ai/plateforme/api-keys",
+      "https://admin.mistral.ai/organization/api-keys",
     );
     mistralGuide.appendText(" 创建密钥，复制到下方；订阅与用量可在 ");
     this.addExternalLink(
@@ -634,9 +1565,14 @@ class DeepSeekTranslatorSettingTab extends PluginSettingTab {
     );
     mistralGuide.appendText(" 查看。");
 
+    const mineruGuide = guide.createEl("li");
+    mineruGuide.appendText("如使用 MinerU，打开 MinerU ");
+    this.addExternalLink(mineruGuide, "API 管理", "https://mineru.net/apiManage/token");
+    mineruGuide.appendText(" 创建精准解析 API Token；使用情况也可通过此链接查看。");
+
     const usageGuide = guide.createEl("li");
     usageGuide.appendText(
-      "普通 Markdown 翻译只需要 DeepSeek 密钥；PDF 一键翻译同时需要 Mistral 和 DeepSeek 密钥。其余设置通常可保持默认。",
+      "普通 Markdown 翻译只需要 DeepSeek 密钥；PDF 一键翻译还需要当前所选 OCR 服务的密钥或 Token。其余设置通常可保持默认。",
     );
 
     this.addPasswordSetting(
@@ -645,12 +1581,35 @@ class DeepSeekTranslatorSettingTab extends PluginSettingTab {
       "用于翻译 Markdown。支持 Secret Storage 时会安全迁移，不再写入 data.json。",
       "apiKey",
     );
-    this.addPasswordSetting(
-      containerEl,
-      "Mistral API 密钥",
-      "用于 PDF OCR。不会读取或复用其他插件中的密钥。",
-      "mistralApiKey",
-    );
+    new Setting(containerEl)
+      .setName("PDF OCR 服务")
+      .setDesc("选择 PDF 上传和 Markdown 解析所使用的服务。DeepSeek 始终负责翻译。")
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("mistral", "Mistral OCR")
+          .addOption("mineru", "MinerU 精准解析")
+          .setValue(this.plugin.settings.ocrProvider)
+          .onChange(async (value) => {
+            await this.updateSetting("ocrProvider", value);
+            this.display();
+          }),
+      );
+
+    if (this.plugin.settings.ocrProvider === "mineru") {
+      this.addPasswordSetting(
+        containerEl,
+        "MinerU API Token",
+        "用于 MinerU 精准解析 API。支持 Secret Storage 时不会写入 data.json。",
+        "mineruApiKey",
+      );
+    } else {
+      this.addPasswordSetting(
+        containerEl,
+        "Mistral API 密钥",
+        "用于 Mistral OCR。不会读取或复用其他插件中的密钥。",
+        "mistralApiKey",
+      );
+    }
 
     containerEl.createEl("h3", { text: "PDF 输出设置" });
     new Setting(containerEl)
@@ -759,7 +1718,7 @@ class DeepSeekTranslatorSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("最大输出 Token")
-      .setDesc("当前版本整篇只发起一次请求；长文仍可能受此值或模型上下文限制。")
+      .setDesc("普通 Markdown 整篇发送；长 PDF 的每个人工分段会分别使用此上限。")
       .addText((text) => {
         text
           .setValue(String(this.plugin.settings.maxTokens))
@@ -768,20 +1727,106 @@ class DeepSeekTranslatorSettingTab extends PluginSettingTab {
         text.inputEl.min = "1";
       });
 
-    containerEl.createEl("h3", { text: "Mistral OCR 设置" });
-    new Setting(containerEl)
-      .setName("OCR 模型")
-      .setDesc("默认使用 Mistral 的最新 OCR 模型别名。")
-      .addText((text) =>
-        text
-          .setPlaceholder(DEFAULT_SETTINGS.mistralModel)
-          .setValue(this.plugin.settings.mistralModel)
-          .onChange((value) => this.updateSetting("mistralModel", value.trim())),
-      );
+    const usingMinerU = this.plugin.settings.ocrProvider === "mineru";
+    containerEl.createEl("h3", { text: usingMinerU ? "MinerU 解析设置" : "Mistral OCR 设置" });
+    if (usingMinerU) {
+      new Setting(containerEl)
+        .setName("API 地址")
+        .setDesc("MinerU 精准解析 API v4 基础地址。")
+        .addText((text) =>
+          text
+            .setPlaceholder(DEFAULT_SETTINGS.mineruBaseUrl)
+            .setValue(this.plugin.settings.mineruBaseUrl)
+            .onChange((value) => this.updateSetting("mineruBaseUrl", value.trim())),
+        );
+
+      new Setting(containerEl)
+        .setName("解析模型")
+        .setDesc("VLM 为官方推荐选项；Pipeline 更接近传统版面分析流程。")
+        .addDropdown((dropdown) =>
+          dropdown
+            .addOption("vlm", "VLM（推荐）")
+            .addOption("pipeline", "Pipeline")
+            .setValue(this.plugin.settings.mineruModelVersion)
+            .onChange((value) => this.updateSetting("mineruModelVersion", value)),
+        );
+
+      new Setting(containerEl)
+        .setName("文档语言")
+        .setDesc("影响 OCR 识别；英文资料填写 en，中文资料填写 ch。")
+        .addText((text) =>
+          text
+            .setPlaceholder("en")
+            .setValue(this.plugin.settings.mineruLanguage)
+            .onChange((value) => this.updateSetting("mineruLanguage", value.trim())),
+        );
+
+      new Setting(containerEl)
+        .setName("强制 OCR")
+        .setDesc("扫描版 PDF 建议开启；含可提取文本的普通 PDF 通常关闭即可。")
+        .addToggle((toggle) =>
+          toggle
+            .setValue(Boolean(this.plugin.settings.mineruForceOcr))
+            .onChange((value) => this.updateSetting("mineruForceOcr", value)),
+        );
+
+      new Setting(containerEl)
+        .setName("识别公式")
+        .setDesc("对应 MinerU enable_formula；VLM 模式下主要影响行内公式。")
+        .addToggle((toggle) =>
+          toggle
+            .setValue(this.plugin.settings.mineruEnableFormula !== false)
+            .onChange((value) => this.updateSetting("mineruEnableFormula", value)),
+        );
+
+      new Setting(containerEl)
+        .setName("识别表格")
+        .setDesc("对应 MinerU enable_table。")
+        .addToggle((toggle) =>
+          toggle
+            .setValue(this.plugin.settings.mineruEnableTable !== false)
+            .onChange((value) => this.updateSetting("mineruEnableTable", value)),
+        );
+
+      new Setting(containerEl)
+        .setName("轮询间隔（秒）")
+        .setDesc("等待 MinerU 异步解析结果时的查询间隔，建议保持 3 秒。")
+        .addText((text) => {
+          text
+            .setValue(String(this.plugin.settings.mineruPollIntervalSeconds))
+            .onChange((value) =>
+              this.updateFiniteNumber("mineruPollIntervalSeconds", value, 1, 60),
+            );
+          text.inputEl.type = "number";
+          text.inputEl.min = "1";
+          text.inputEl.max = "60";
+        });
+
+      new Setting(containerEl)
+        .setName("单次等待上限（分钟）")
+        .setDesc("超过后算作一次失败；重试会继续查询同一个 MinerU 批次，不会重复上传。")
+        .addText((text) => {
+          text
+            .setValue(String(this.plugin.settings.mineruTimeoutMinutes))
+            .onChange((value) => this.updatePositiveInteger("mineruTimeoutMinutes", value));
+          text.inputEl.type = "number";
+          text.inputEl.min = "1";
+        });
+    } else {
+      new Setting(containerEl)
+        .setName("OCR 模型")
+        .setDesc("默认使用 Mistral 的最新 OCR 模型别名。")
+        .addText((text) =>
+          text
+            .setPlaceholder(DEFAULT_SETTINGS.mistralModel)
+            .setValue(this.plugin.settings.mistralModel)
+            .onChange((value) => this.updateSetting("mistralModel", value.trim())),
+        );
+    }
 
     new Setting(containerEl)
       .setName("提取图片")
-      .setDesc("将 Mistral 返回的图片写入 Obsidian 默认附件路径，并重写 Markdown 链接。")
+      .setDesc(`将 ${usingMinerU ? "MinerU" : "Mistral"} 返回的图片写入 Obsidian 默认附件路径，并重写 Markdown 链接。`)
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.extractImages).onChange(async (value) => {
           await this.updateSetting("extractImages", value);
@@ -792,7 +1837,7 @@ class DeepSeekTranslatorSettingTab extends PluginSettingTab {
     if (this.plugin.settings.extractImages) {
       new Setting(containerEl)
         .setName("图片数量上限")
-        .setDesc("0 表示不限制。")
+        .setDesc(usingMinerU ? "0 表示不限制；MinerU 结果下载后在本地应用此限制。" : "0 表示不限制。")
         .addText((text) => {
           text
             .setValue(String(this.plugin.settings.imageLimit))
@@ -803,7 +1848,11 @@ class DeepSeekTranslatorSettingTab extends PluginSettingTab {
 
       new Setting(containerEl)
         .setName("图片最小尺寸")
-        .setDesc("宽和高的最小像素值；0 表示不限制。")
+        .setDesc(
+          usingMinerU
+            ? "宽和高的最小像素值；0 表示不限制。MinerU 图片会在本地过滤。"
+            : "宽和高的最小像素值；0 表示不限制。",
+        )
         .addText((text) => {
           text
             .setValue(String(this.plugin.settings.imageMinSize))
@@ -815,20 +1864,45 @@ class DeepSeekTranslatorSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("页面之间添加分隔线")
-      .setDesc("开启后在每页 OCR Markdown 之间插入 ---。")
+      .setDesc(
+        usingMinerU
+          ? "MinerU 的 full.md 不保留逐页 Markdown 边界，因此此选项仅适用于 Mistral。"
+          : "开启后在每页 OCR Markdown 之间插入 ---。",
+      )
       .addToggle((toggle) =>
         toggle
           .setValue(this.plugin.settings.paginate)
+          .setDisabled(usingMinerU)
           .onChange((value) => this.updateSetting("paginate", value)),
       );
 
+    if (usingMinerU) {
+      new Setting(containerEl)
+        .setName("远程任务清理")
+        .setDesc(
+          "MinerU 精准解析 API 目前没有公开的任务或上传文件删除接口，插件无法主动删除已经提交的远程任务。",
+        );
+    } else {
+      new Setting(containerEl)
+        .setName("删除 Mistral 远程临时文件")
+        .setDesc("建议开启；OCR 响应返回后立即尝试删除上传的 PDF。")
+        .addToggle((toggle) =>
+          toggle
+            .setValue(this.plugin.settings.deleteMistralFile)
+            .onChange((value) => this.updateSetting("deleteMistralFile", value)),
+        );
+    }
+
+    containerEl.createEl("h3", { text: "调试" });
     new Setting(containerEl)
-      .setName("删除 Mistral 远程临时文件")
-      .setDesc("建议开启；OCR 响应返回后立即尝试删除上传的 PDF。")
+      .setName("调试模式")
+      .setDesc(
+        "开启后把最近一次任务的阶段、重试、错误、OCR 文本和译文保存到插件目录的 debug-last-task.json。每次任务会覆盖上一次；不会保存 API 密钥、签名 URL 或图片 Base64。调试文件包含文档正文，请勿随意分享。",
+      )
       .addToggle((toggle) =>
         toggle
-          .setValue(this.plugin.settings.deleteMistralFile)
-          .onChange((value) => this.updateSetting("deleteMistralFile", value)),
+          .setValue(Boolean(this.plugin.settings.debugMode))
+          .onChange((value) => this.updateSetting("debugMode", value)),
       );
 
     containerEl.createEl("h3", { text: "翻译提示词" });
