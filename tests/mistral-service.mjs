@@ -37,6 +37,7 @@ const settings = {
   extractImages: true,
   imageLimit: 0,
   imageMinSize: 16,
+  mistralKeepHeadersFooters: false,
   deleteMistralFile: true,
 };
 const stages = [];
@@ -62,6 +63,8 @@ assert.equal(ocrInput.document.type, "document_url");
 assert.equal(ocrInput.includeImageBase64, true);
 assert.equal(ocrInput.imageLimit, undefined);
 assert.equal(ocrInput.imageMinSize, 16);
+assert.equal(ocrInput.extractHeader, true);
+assert.equal(ocrInput.extractFooter, true);
 assert.equal(ocrInput.includeBlocks, false);
 
 assert.equal(await service.checkConnection(), true);

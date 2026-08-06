@@ -83,6 +83,8 @@ export class MistralOcrService {
       includeImageBase64: Boolean(this.settings.extractImages),
       imageLimit,
       imageMinSize,
+      extractHeader: this.settings.mistralKeepHeadersFooters === false,
+      extractFooter: this.settings.mistralKeepHeadersFooters === false,
       includeBlocks: false,
     });
     if (!Array.isArray(response?.pages) || response.pages.length === 0) {

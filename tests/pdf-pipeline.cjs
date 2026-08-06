@@ -94,7 +94,7 @@ Module._load = function (request, parent, isMain) {
   }
   return originalLoad.call(this, request, parent, isMain);
 };
-const exported = require("../main.js");
+const exported = require(process.env.PDF_TRANSLATE_TEST_BUNDLE || "../main.js");
 Module._load = originalLoad;
 const PluginClass = exported.default || exported;
 
@@ -117,6 +117,10 @@ const vault = {
   async readBinary(file) {
     assert.equal(files.has(file.path), true);
     return new Uint8Array([37, 80, 68, 70]).buffer;
+  },
+  async cachedRead(file) {
+    assert.equal(files.has(file.path), true);
+    return "# English Markdown";
   },
   async createFolder(path) {
     const folder = new TFolder(path);
@@ -249,10 +253,21 @@ plugin.createMistralService = () => ({
   assert.equal(defaultPlugin.settings.outputSuffix, "_翻译");
   assert.equal(defaultPlugin.settings.keepOcrMarkdown, false);
   assert.equal(defaultPlugin.settings.paginate, true);
+  assert.equal(defaultPlugin.settings.ocrOnlyProvider, "mistral");
+  assert.equal(defaultPlugin.settings.ocrOnlyOutputSuffix, "_OCR");
+  assert.equal(defaultPlugin.settings.ocrOnlyPaginate, true);
+  assert.equal(defaultPlugin.settings.mistralKeepHeadersFooters, true);
+  assert.equal(defaultPlugin.settings.ocrOnlyMistralKeepHeadersFooters, true);
+  assert.equal(defaultPlugin.settings.markdownModel, "deepseek-v4-flash");
+  assert.equal(defaultPlugin.settings.markdownOutputSuffix, "_翻译");
+  assert.equal(
+    defaultPlugin.settings.markdownTranslationPrompt,
+    defaultPlugin.settings.translationPrompt,
+  );
   assert.equal(defaultPlugin.settings.debugMode, false);
   assert.equal(
     crypto.createHash("sha256").update(defaultPlugin.settings.translationPrompt).digest("hex"),
-    "45a2428f5a6be0bd18d6778a20e6c82a6f0a6731dacf2f23d68b8018bb3c61e5",
+    "335276be2e6e9d32738a2a41ddfa44de188c5e895dc40ee7ae18569861c82251",
   );
 
   await plugin.translatePdf(pdf);
@@ -449,8 +464,8 @@ plugin.createMistralService = () => ({
     debugMode: true,
   };
   retryPlugin.manifest = {
-    id: "deepseek-translator",
-    dir: ".obsidian/plugins/deepseek-translator",
+    id: "pdf-translate-to-markdown",
+    dir: ".obsidian/plugins/pdf-translate-to-markdown",
   };
   retryPlugin.busyFiles = new Set();
   retryPlugin.activeProgress = new Set();
@@ -514,7 +529,7 @@ plugin.createMistralService = () => ({
   assert.match(createdText.get("docs/retry_翻译.md"), /已恢复 \$x\$/);
   assert.doesNotMatch(createdText.get("docs/retry_翻译.md"), /\\\(/);
   const debugSnapshotText = debugWrites.get(
-    ".obsidian/plugins/deepseek-translator/debug-last-task.json",
+    ".obsidian/plugins/pdf-translate-to-markdown/debug-last-task.json",
   );
   const debugSnapshot = JSON.parse(debugSnapshotText);
   assert.equal(debugSnapshot.status, "completed");
@@ -634,6 +649,91 @@ plugin.createMistralService = () => ({
   assert.equal(createdText.has("docs/mineru_翻译.md"), true);
   assert.match(createdText.get("docs/mineru.md"), /MinerU \$x\$/);
 
+  const ocrOnlyPdf = new TFile("docs/ocr-only.pdf");
+  files.set(ocrOnlyPdf.path, ocrOnlyPdf);
+  const ocrOnlyPlugin = new PluginClass(app);
+  ocrOnlyPlugin.settings = {
+    ...plugin.settings,
+    ocrOnlyProvider: "mistral",
+    ocrOnlyOutputMode: "same-folder",
+    ocrOnlyMovePdfToSubfolder: false,
+    ocrOnlyOutputSuffix: "_OCR",
+    ocrOnlyMistralModel: "mistral-ocr-latest",
+    ocrOnlyExtractImages: false,
+    ocrOnlyImageLimit: 0,
+    ocrOnlyImageMinSize: 0,
+    ocrOnlyPaginate: false,
+    ocrOnlyDeleteMistralFile: true,
+    debugMode: false,
+  };
+  ocrOnlyPlugin.busyFiles = new Set();
+  ocrOnlyPlugin.activeProgress = new Set();
+  const ocrOnlyRanges = [];
+  ocrOnlyPlugin.createPdfDocumentService = () => ({
+    async load() {
+      return 205;
+    },
+    async createSegments(ranges) {
+      ocrOnlyRanges.push(...ranges);
+      return ranges.map((range) => ({
+        ...range,
+        isWholeDocument: false,
+        arrayBuffer: new Uint8Array([range.start, range.end]).buffer,
+      }));
+    },
+  });
+  let ocrOnlyUploads = 0;
+  let ocrOnlyDeletes = 0;
+  ocrOnlyPlugin.createMistralService = (settings) => {
+    assert.equal(settings.mistralModel, "mistral-ocr-latest");
+    assert.equal(settings.extractImages, false);
+    return {
+      supportsRemoteDelete: true,
+      async checkConnection() {
+        return true;
+      },
+      async uploadPdf(_bytes, fileName) {
+        ocrOnlyUploads += 1;
+        return { fileId: fileName, url: fileName };
+      },
+      async getSignedUrl(fileId) {
+        return fileId;
+      },
+      async processOcr(fileName) {
+        const match = fileName.match(/p(\d{4})-(\d{4})/);
+        const start = Number(match[1]);
+        const end = Number(match[2]);
+        return {
+          pages: Array.from({ length: end - start + 1 }, (_, index) => ({
+            index,
+            markdown: `OCR ${start + index}`,
+            images: [],
+          })),
+        };
+      },
+      async deleteFile() {
+        ocrOnlyDeletes += 1;
+        return { deleted: true };
+      },
+    };
+  };
+  ocrOnlyPlugin.requestTranslation = async () => {
+    throw new Error("OCR-only workflow must not call DeepSeek");
+  };
+
+  await ocrOnlyPlugin.ocrPdfOnly(ocrOnlyPdf);
+  assert.deepEqual(ocrOnlyRanges, [
+    { start: 1, end: 100 },
+    { start: 101, end: 200 },
+    { start: 201, end: 205 },
+  ]);
+  assert.equal(ocrOnlyUploads, 3);
+  assert.equal(ocrOnlyDeletes, 3);
+  assert.equal(createdText.has("docs/ocr-only_OCR.md"), true);
+  assert.match(createdText.get("docs/ocr-only_OCR.md"), /^OCR 1/);
+  assert.match(createdText.get("docs/ocr-only_OCR.md"), /OCR 205\n$/);
+  assert.equal(opened.at(-1), "docs/ocr-only_OCR.md");
+
   let incompleteMetadata;
   deepSeekFinishReason = "length";
   await assert.rejects(
@@ -646,6 +746,86 @@ plugin.createMistralService = () => ({
   );
   assert.equal(incompleteMetadata.finishReason, "length");
   deepSeekFinishReason = "stop";
+
+  const outlinePlugin = new PluginClass(app);
+  outlinePlugin.settings = { ...plugin.settings, extractImages: true };
+  outlinePlugin.waitBeforeRetry = async () => {};
+  await outlinePlugin.requestChapterOutline("--- PDF_PAGE: 1 ---\nContents", 120, 15);
+  const outlineRequestBody = JSON.parse(deepSeekRequest.body);
+  assert.deepEqual(outlineRequestBody.thinking, { type: "disabled" });
+  assert.equal(outlineRequestBody.reasoning_effort, undefined);
+  assert.equal(outlineRequestBody.temperature, 0.1);
+  assert.equal(outlineRequestBody.max_tokens, 100000);
+  const outlineOcrRanges = [];
+  let outlineDeletes = 0;
+  outlinePlugin.createOcrService = () => ({
+    providerId: "mistral",
+    providerName: "Mistral",
+    supportsRemoteDelete: true,
+    async uploadPdf(bytes, fileName) {
+      const [start, end] = [...new Uint8Array(bytes)];
+      outlineOcrRanges.push([start, end]);
+      return { fileId: `outline-${start}-${end}`, url: fileName };
+    },
+    async getSignedUrl(fileId) {
+      return fileId;
+    },
+    async processOcr(url) {
+      const match = url.match(/p(\d{4})-(\d{4})/);
+      const start = Number(match[1]);
+      const end = Number(match[2]);
+      return {
+        pages: Array.from({ length: end - start + 1 }, (_, index) => ({
+          index,
+          markdown: `OCR physical page ${start + index}`,
+          images: [],
+        })),
+      };
+    },
+    async deleteFile() {
+      outlineDeletes += 1;
+      return { deleted: true };
+    },
+  });
+  const outlineAnalysisEnds = [];
+  outlinePlugin.requestChapterOutline = async (_markdown, pageCount, analyzedThroughPage) => {
+    outlineAnalysisEnds.push(analyzedThroughPage);
+    const result = analyzedThroughPage < 35
+      ? { status: "need_more", reason: "正文页码尚未出现", ranges: [] }
+      : {
+          status: "ready",
+          pageMapping: { pdfPage: 17, printedPage: 1, offset: 16 },
+          chapters: [
+            { number: 1, title: "One", printedStartPage: 5 },
+            { number: 2, title: "Two", printedStartPage: 55 },
+          ],
+          backMatter: null,
+          warnings: [],
+        };
+    return { finishReason: "stop", content: JSON.stringify(result) };
+  };
+  const outlineDocument = {
+    async createSegments(ranges) {
+      return ranges.map((range) => ({
+        ...range,
+        isWholeDocument: false,
+        arrayBuffer: new Uint8Array([range.start, range.end]).buffer,
+      }));
+    },
+  };
+  const outlineResult = await outlinePlugin.detectPdfChapterRanges({
+    file: largePdf,
+    pageCount: 120,
+    pdfDocument: outlineDocument,
+  });
+  assert.deepEqual(outlineOcrRanges, [[1, 15], [16, 25], [26, 35]]);
+  assert.deepEqual(outlineAnalysisEnds, [15, 25, 35]);
+  assert.equal(outlineDeletes, 3);
+  assert.deepEqual(outlineResult.ranges.map(({ start, end }) => ({ start, end })), [
+    { start: 1, end: 20 },
+    { start: 21, end: 70 },
+    { start: 71, end: 120 },
+  ]);
 
   const offlinePdf = new TFile("docs/offline.pdf");
   files.set(offlinePdf.path, offlinePdf);
@@ -677,6 +857,59 @@ plugin.createMistralService = () => ({
   assert.equal(offlineDeepSeekChecks, 3);
   assert.equal(offlinePrompts, 1);
   assert.equal(offlinePlugin.busyFiles.size, 0);
+
+  const rateLimitPlugin = new PluginClass(app);
+  rateLimitPlugin.settings = { ...plugin.settings };
+  const retryWaits = [];
+  const retryLabels = [];
+  rateLimitPlugin.waitBeforeRetry = async (_attempt, waitMs) => retryWaits.push(waitMs);
+  let rateLimitCalls = 0;
+  const rateLimitResult = await rateLimitPlugin.runStageWithRetries(
+    "Mistral OCR",
+    async () => {
+      rateLimitCalls += 1;
+      if (rateLimitCalls === 1) {
+        const error = new Error("429 Too Many Requests");
+        error.status = 429;
+        error.headers = { "retry-after": "2" };
+        throw error;
+      }
+      return "ok";
+    },
+    (label) => retryLabels.push(label),
+  );
+  assert.equal(rateLimitResult, "ok");
+  assert.equal(rateLimitCalls, 2);
+  assert.equal(retryWaits.length, 1);
+  assert.equal(retryWaits[0] >= 2000 && retryWaits[0] < 3000, true);
+  assert.match(retryLabels[0], /速率限制/);
+
+  const markdownFile = new TFile("docs/standalone.md");
+  files.set(markdownFile.path, markdownFile);
+  const markdownPlugin = new PluginClass(app);
+  markdownPlugin.settings = {
+    ...plugin.settings,
+    markdownBaseUrl: "https://markdown.deepseek.test",
+    markdownModel: "markdown-model",
+    markdownThinkingEnabled: false,
+    markdownReasoningEffort: "high",
+    markdownTemperature: 0.4,
+    markdownMaxTokens: 4321,
+    markdownOutputSuffix: "_单独翻译",
+    markdownTranslationPrompt: "Markdown 专用提示词",
+    debugMode: false,
+  };
+  markdownPlugin.busyFiles = new Set();
+  markdownPlugin.activeProgress = new Set();
+  await markdownPlugin.translateFile(markdownFile);
+  const markdownRequestBody = JSON.parse(deepSeekRequest.body);
+  assert.equal(deepSeekRequest.url, "https://markdown.deepseek.test/chat/completions");
+  assert.equal(markdownRequestBody.model, "markdown-model");
+  assert.equal(markdownRequestBody.messages[0].content, "Markdown 专用提示词");
+  assert.deepEqual(markdownRequestBody.thinking, { type: "disabled" });
+  assert.equal(markdownRequestBody.temperature, 0.4);
+  assert.equal(markdownRequestBody.max_tokens, 4321);
+  assert.equal(createdText.has("docs/standalone_单独翻译.md"), true);
 
   console.log("PDF pipeline test passed");
 })().catch((error) => {

@@ -166,6 +166,7 @@ export class MinerUOcrService {
     }
 
     const pageByImage = this.imagePageMap(contentList);
+    const analysisPages = this.contentListPages(contentList, pageCount);
     const images = this.settings.extractImages
       ? this.extractImages(files, names, pageByImage)
       : [];
@@ -174,7 +175,57 @@ export class MinerUOcrService {
       batchId,
       pageCount,
       pages: [{ index: 0, markdown, images }],
+      analysisPages,
     };
+  }
+
+  contentListPages(contentList, pageCount) {
+    if (!Array.isArray(contentList) || !Number.isInteger(pageCount) || pageCount < 1) {
+      return [];
+    }
+    const pageParts = Array.from({ length: pageCount }, () => []);
+    for (const item of contentList) {
+      const pageIndex = Number(item?.page_idx);
+      if (!Number.isInteger(pageIndex) || pageIndex < 0 || pageIndex >= pageCount) {
+        continue;
+      }
+      const text = this.contentListItemText(item);
+      if (text) {
+        pageParts[pageIndex].push(text);
+      }
+    }
+    return pageParts.map((parts, index) => ({
+      index,
+      markdown: parts.join("\n\n").trim(),
+    }));
+  }
+
+  contentListItemText(item) {
+    const type = String(item?.type || "").toLowerCase();
+    const values = [];
+    const add = (value) => {
+      if (Array.isArray(value)) {
+        for (const entry of value) {
+          add(entry);
+        }
+        return;
+      }
+      if (typeof value === "string" && value.trim()) {
+        values.push(value.trim());
+      }
+    };
+    add(item?.text);
+    add(item?.table_body);
+    add(item?.image_caption);
+    add(item?.image_footnote);
+    if (values.length === 0) {
+      return "";
+    }
+    if (type === "title") {
+      const level = Math.min(6, Math.max(1, Number(item?.text_level) || 1));
+      return `${"#".repeat(level)} ${values.join(" ")}`;
+    }
+    return values.join("\n");
   }
 
   extractImages(files, names, pageByImage) {

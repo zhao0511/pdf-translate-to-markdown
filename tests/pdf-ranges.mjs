@@ -6,6 +6,7 @@ import {
   countSelectedPages,
   createNextPdfRangeDraft,
   createDefaultPdfRanges,
+  findPdfRangeGaps,
   mergeMarkdownParts,
   parsePdfRangeRules,
   shouldAutoFillPdfRangeEnd,
@@ -25,6 +26,15 @@ assert.deepEqual(normalized, [
   { start: 101, end: 150 },
 ]);
 assert.equal(countSelectedPages(normalized), 101);
+assert.deepEqual(findPdfRangeGaps([{ start: 1, end: 9 }, { start: 12, end: 20 }], 25), [
+  { start: 10, end: 11 },
+  { start: 21, end: 25 },
+]);
+assert.deepEqual(findPdfRangeGaps([{ start: 10, end: 20 }], 25), [
+  { start: 1, end: 9 },
+  { start: 21, end: 25 },
+]);
+assert.deepEqual(findPdfRangeGaps([{ start: 1, end: 25 }], 25), []);
 assert.deepEqual(createDefaultPdfRanges(230), [
   { start: 1, end: 100 },
   { start: 101, end: 200 },

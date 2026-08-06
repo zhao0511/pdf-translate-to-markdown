@@ -14,7 +14,11 @@ const zipBytes = zipSync({
     JSON.stringify({ pdf_info: [{ page_idx: 0 }, { page_idx: 1 }] }),
   ),
   "result/paper_content_list.json": strToU8(
-    JSON.stringify([{ type: "image", img_path: "images/hash.png", page_idx: 1 }]),
+    JSON.stringify([
+      { type: "title", text: "Contents", text_level: 1, page_idx: 0 },
+      { type: "text", text: "Chapter 1 ........ 1", page_idx: 0 },
+      { type: "image", img_path: "images/hash.png", page_idx: 1 },
+    ]),
   ),
   "result/images/hash.png": png,
 });
@@ -109,6 +113,8 @@ const response = await service.processOcr(uploaded.url, {
 assert.equal(response.provider, "mineru");
 assert.equal(response.pageCount, 2);
 assert.equal(response.pages.length, 1);
+assert.equal(response.analysisPages.length, 2);
+assert.match(response.analysisPages[0].markdown, /Chapter 1/);
 assert.match(response.pages[0].markdown, /Title/);
 assert.equal(response.pages[0].images.length, 1);
 assert.equal(response.pages[0].images[0].id, "hash.png");

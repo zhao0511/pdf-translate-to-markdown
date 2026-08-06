@@ -88,6 +88,34 @@ export function countSelectedPages(ranges) {
   return ranges.reduce((total, { start, end }) => total + end - start + 1, 0);
 }
 
+export function findPdfRangeGaps(ranges, pageCount) {
+  if (!Number.isInteger(pageCount) || pageCount < 1) {
+    return [];
+  }
+  const usableRanges = (Array.isArray(ranges) ? ranges : [])
+    .map((range) => ({ start: Number(range?.start), end: Number(range?.end) }))
+    .filter(({ start, end }) => Number.isInteger(start) && Number.isInteger(end) && start <= end)
+    .map(({ start, end }) => ({
+      start: Math.max(1, start),
+      end: Math.min(pageCount, end),
+    }))
+    .filter(({ start, end }) => start <= end)
+    .sort((left, right) => left.start - right.start || left.end - right.end);
+
+  const gaps = [];
+  let nextPage = 1;
+  for (const range of usableRanges) {
+    if (range.start > nextPage) {
+      gaps.push({ start: nextPage, end: range.start - 1 });
+    }
+    nextPage = Math.max(nextPage, range.end + 1);
+  }
+  if (nextPage <= pageCount) {
+    gaps.push({ start: nextPage, end: pageCount });
+  }
+  return gaps;
+}
+
 export function shouldAutoFillPdfRangeEnd(start, pageCount, threshold = 50) {
   const firstPage = Number(start);
   return (

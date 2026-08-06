@@ -26,7 +26,7 @@ const remoteFiles = new Map([
   [`${assetBase}/main.js`, "new-main"],
   [
     `${assetBase}/manifest.json`,
-    JSON.stringify({ id: "deepseek-translator", version: "0.5.0" }),
+    JSON.stringify({ id: "pdf-translate-to-markdown", version: "0.5.0" }),
   ],
   [`${assetBase}/styles.css`, "new-styles"],
 ]);
@@ -40,7 +40,7 @@ const request = async ({ url }) => {
   return { status: 404, text: "" };
 };
 
-const pluginFolder = ".obsidian/plugins/deepseek-translator";
+const pluginFolder = ".obsidian/plugins/pdf-translate-to-markdown";
 const disk = new Map([
   [`${pluginFolder}/main.js`, "old-main"],
   [`${pluginFolder}/manifest.json`, "old-manifest"],
@@ -61,7 +61,7 @@ const adapter = {
   },
 };
 const app = { vault: { configDir: ".obsidian", adapter } };
-const service = new GithubReleaseService(app, "deepseek-translator", "0.4.1", request);
+const service = new GithubReleaseService(app, "pdf-translate-to-markdown", "0.4.1", request);
 
 const latest = await service.getLatestRelease();
 assert.equal(latest.version, "0.5.0");

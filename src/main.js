@@ -24,6 +24,12 @@ import {
   shortContentHash,
   stripDataUrlPrefix,
 } from "./markdown-utils.js";
+import {
+  buildChapterOutlineRanges,
+  buildPageMarkedMarkdown,
+  chapterOutlineStatus,
+  parseChapterOutlineResponse,
+} from "./chapter-outline-utils.mjs";
 import { MistralOcrService } from "./mistral-ocr-service.mjs";
 import { MinerUOcrService } from "./mineru-ocr-service.mjs";
 import { PdfDocumentService } from "./pdf-document-service.mjs";
@@ -31,6 +37,7 @@ import { PdfRangeModal } from "./pdf-range-modal.js";
 import {
   PDF_SPLIT_THRESHOLD,
   countSelectedPages,
+  createDefaultPdfRanges,
   mergeMarkdownParts,
 } from "./pdf-range-utils.mjs";
 import { TaskProgress } from "./task-progress.js";
@@ -38,6 +45,8 @@ import { TaskFailureModal } from "./task-failure-modal.js";
 import { GithubReleaseService, isVersionNewer } from "./update-service.mjs";
 
 const MAX_STAGE_ATTEMPTS = 3;
+const MAX_RATE_LIMIT_ATTEMPTS = 6;
+const DEFAULT_RATE_LIMIT_WAIT_MS = 60000;
 
 class DeepSeekTranslatorPlugin extends Plugin {
   async onload() {
@@ -77,7 +86,14 @@ class DeepSeekTranslatorPlugin extends Plugin {
         if (extension === "pdf") {
           menu.addItem((item) => {
             item
-              .setTitle("OCR 并翻译为 Markdown")
+              .setTitle("仅转为 Markdown")
+              .setIcon("scan-line")
+              .setSection("action")
+              .onClick(() => this.ocrPdfOnly(file));
+          });
+          menu.addItem((item) => {
+            item
+              .setTitle("转为 Markdown 并翻译")
               .setIcon("scan-text")
               .setSection("action")
               .onClick(() => this.translatePdf(file));
@@ -159,8 +175,9 @@ class DeepSeekTranslatorPlugin extends Plugin {
       return;
     }
 
+    const translationSettings = this.getMarkdownTranslationRuntimeSettings();
     const progress = this.createProgress(file.name, 3, "翻译");
-    const debugSession = this.createDebugSession("markdown", file);
+    const debugSession = this.createDebugSession("markdown", file, translationSettings);
     try {
       progress.setPhase(1, "读取 Markdown");
       const markdown = await this.app.vault.cachedRead(file);
@@ -176,6 +193,7 @@ class DeepSeekTranslatorPlugin extends Plugin {
         "翻译",
         (attempt) =>
           this.requestTranslation(prepared.markdown, {
+            settings: translationSettings,
             onResponse: (response) =>
               this.updateDebugSession(debugSession, "translation-response", {
                 attempt,
@@ -197,7 +215,7 @@ class DeepSeekTranslatorPlugin extends Plugin {
         mathReplacementCount: translated.replacementCount,
       });
       progress.setPhase(3, "保存译文");
-      const outputPath = this.getAvailableMarkdownTranslationPath(file);
+      const outputPath = this.getAvailableMarkdownTranslationPath(file, translationSettings);
       const outputFile = await this.app.vault.create(outputPath, translated.markdown);
       await this.openFileSafely(outputFile);
       await this.updateDebugSession(debugSession, "output-saved", {
@@ -246,7 +264,11 @@ class DeepSeekTranslatorPlugin extends Plugin {
       let ranges = [{ start: 1, end: pageCount }];
       if (pageCount > PDF_SPLIT_THRESHOLD) {
         progress.setPhase(3, "等待选择翻译页码");
-        ranges = await this.choosePdfRanges(file, pageCount);
+        ranges = await this.choosePdfRanges(file, pageCount, {
+          pdfDocument,
+          pdfBytes,
+          debugSession,
+        });
         if (!ranges) {
           await this.finishDebugSession(debugSession, "cancelled");
           new Notice("已取消 PDF 翻译。", 4000);
@@ -382,6 +404,147 @@ class DeepSeekTranslatorPlugin extends Plugin {
     }
   }
 
+  async ocrPdfOnly(file) {
+    const ocrSettings = this.getOcrOnlyRuntimeSettings();
+    if (!this.requireOcrProviderKey(ocrSettings)) {
+      return;
+    }
+    if (!this.startFileTask(file)) {
+      return;
+    }
+
+    const progress = this.createProgress(file.name, 6, "仅转为 Markdown");
+    const debugSession = this.createDebugSession("pdf-ocr-only", file, ocrSettings);
+    try {
+      progress.setPhase(1, "检查 OCR API 连接");
+      const connected = await this.ensureOcrOnlyApiConnection(
+        progress,
+        debugSession,
+        ocrSettings,
+      );
+      if (!connected) {
+        await this.finishDebugSession(debugSession, "abandoned");
+        return;
+      }
+
+      progress.setPhase(2, "读取并拆分 PDF");
+      const pdfBytes = await this.app.vault.readBinary(file);
+      const pdfHash = await shortContentHash(pdfBytes);
+      const pdfDocument = this.createPdfDocumentService();
+      const pageCount = await pdfDocument.load(pdfBytes);
+      const ranges = createDefaultPdfRanges(pageCount, 100);
+      await this.updateDebugSession(debugSession, "pdf-loaded", {
+        pageCount,
+        pdfHash,
+        automaticChunkSize: 100,
+      });
+
+      const outputPlan = this.getAvailableOcrOnlyOutputPlan(file, ocrSettings);
+      await this.ensureOutputFolder(outputPlan.outputFolder);
+      const segments = await pdfDocument.createSegments(ranges);
+      const states = segments.map((segment, index) =>
+        this.createPdfSegmentState(segment, index, file, ocrSettings),
+      );
+      await this.initializeDebugSegments(debugSession, states, ranges);
+
+      const updateAggregateProgress = (retryLabel = "") => {
+        const uploaded = states.filter((state) => state.uploaded).length;
+        const ocrDone = states.filter((state) => state.ocrDone).length;
+        progress.update(
+          `上传 ${uploaded}/${states.length}｜OCR ${ocrDone}/${states.length}${
+            retryLabel ? `｜${retryLabel}` : ""
+          }`,
+        );
+      };
+      progress.setPhase(3, `上传 0/${states.length}｜OCR 0/${states.length}`);
+      updateAggregateProgress();
+
+      let abandoned = false;
+      while (states.some((state) => !state.ocrDone)) {
+        for (const state of states) {
+          state.failure = null;
+        }
+        const failures = await this.processPdfAttempt({
+          states,
+          file,
+          outputPlan,
+          pdfHash,
+          updateProgress: updateAggregateProgress,
+          debugSession,
+          includeTranslation: false,
+        });
+        if (failures.length === 0) {
+          break;
+        }
+
+        updateAggregateProgress("等待选择");
+        const action = await this.askOcrOnlyFailureAction(states, failures, ocrSettings);
+        if (action === "retry") {
+          await this.updateDebugSession(debugSession, "user-retry", {
+            failedSegments: failures.map(({ state }) => state.index + 1),
+          });
+          updateAggregateProgress("正在重试");
+          continue;
+        }
+
+        abandoned = true;
+        updateAggregateProgress("正在清理");
+        const cleanup = await this.cleanupPdfSegmentStates(states, {
+          forceRemoteDelete: true,
+        });
+        await this.updateDebugSession(debugSession, "user-abandon", { cleanup });
+        new Notice(
+          cleanup.failed === 0
+            ? "已放弃 OCR，并清理本次任务的中间结果。"
+            : `已放弃 OCR，但有 ${cleanup.failed} 项中间结果清理失败，请查看控制台。`,
+          cleanup.failed === 0 ? 6000 : 12000,
+        );
+        break;
+      }
+      if (abandoned) {
+        await this.finishDebugSession(debugSession, "abandoned");
+        return;
+      }
+
+      progress.setPhase(4, "合并 OCR 结果");
+      const separator =
+        ocrSettings.ocrProvider !== "mineru" && ocrSettings.paginate
+          ? "\n\n---\n\n"
+          : "\n\n";
+      const markdown = mergeMarkdownParts(
+        states.map((state) => state.ocrMarkdown),
+        separator,
+      );
+
+      progress.setPhase(5, "保存 OCR Markdown");
+      const outputFile = await this.app.vault.create(outputPlan.ocrPath, markdown);
+      if (outputPlan.useSubfolder && ocrSettings.movePdfToSubfolder) {
+        await this.movePdfIfRequested(file, outputPlan, true);
+      }
+      await this.openFileSafely(outputFile);
+      await this.updateDebugSession(debugSession, "output-saved", {
+        ocrPath: outputFile.path,
+      });
+
+      const savedImageCount = states.reduce(
+        (total, state) => total + state.imageLinks.size,
+        0,
+      );
+      progress.setPhase(6, "完成输出");
+      progress.complete(
+        `OCR 完成：${outputFile.path}（${pageCount} 页；${ranges.length} 个部分；${savedImageCount} 张图片）`,
+      );
+      await this.finishDebugSession(debugSession, "completed");
+    } catch (error) {
+      console.error("Pdf translate to markdown OCR-only pipeline:", error);
+      await this.finishDebugSession(debugSession, "failed", error);
+      progress.fail(this.getErrorMessage(error));
+    } finally {
+      this.finishFileTask(file, progress);
+      void this.checkForUpdates();
+    }
+  }
+
   async checkForUpdates(options = {}) {
     const manual = Boolean(options.manual);
     if (!this.releaseService) {
@@ -460,33 +623,415 @@ class DeepSeekTranslatorPlugin extends Plugin {
     }
   }
 
-  createMistralService() {
-    return new MistralOcrService(this.settings);
+  createMistralService(settings = this.settings) {
+    return new MistralOcrService(settings);
   }
 
-  createMinerUService() {
-    return new MinerUOcrService(this.settings, requestUrl);
+  createMinerUService(settings = this.settings) {
+    return new MinerUOcrService(settings, requestUrl);
   }
 
-  createOcrService() {
-    return this.settings.ocrProvider === "mineru"
-      ? this.createMinerUService()
-      : this.createMistralService();
+  createOcrService(settings = this.settings) {
+    return settings.ocrProvider === "mineru"
+      ? this.createMinerUService(settings)
+      : this.createMistralService(settings);
   }
 
-  ocrProviderName() {
-    return this.settings.ocrProvider === "mineru" ? "MinerU" : "Mistral";
+  ocrProviderName(settings = this.settings) {
+    return settings.ocrProvider === "mineru" ? "MinerU" : "Mistral";
+  }
+
+  getOcrOnlyRuntimeSettings() {
+    return {
+      ...this.settings,
+      ocrProvider: this.settings.ocrOnlyProvider === "mineru" ? "mineru" : "mistral",
+      mistralModel:
+        this.settings.ocrOnlyMistralModel || DEFAULT_SETTINGS.ocrOnlyMistralModel,
+      mineruBaseUrl:
+        this.settings.ocrOnlyMineruBaseUrl || DEFAULT_SETTINGS.ocrOnlyMineruBaseUrl,
+      mineruModelVersion:
+        this.settings.ocrOnlyMineruModelVersion ||
+        DEFAULT_SETTINGS.ocrOnlyMineruModelVersion,
+      mineruLanguage:
+        this.settings.ocrOnlyMineruLanguage || DEFAULT_SETTINGS.ocrOnlyMineruLanguage,
+      mineruForceOcr: Boolean(this.settings.ocrOnlyMineruForceOcr),
+      mineruEnableFormula: this.settings.ocrOnlyMineruEnableFormula !== false,
+      mineruEnableTable: this.settings.ocrOnlyMineruEnableTable !== false,
+      mineruPollIntervalSeconds:
+        Number(this.settings.ocrOnlyMineruPollIntervalSeconds) ||
+        DEFAULT_SETTINGS.ocrOnlyMineruPollIntervalSeconds,
+      mineruTimeoutMinutes:
+        Number(this.settings.ocrOnlyMineruTimeoutMinutes) ||
+        DEFAULT_SETTINGS.ocrOnlyMineruTimeoutMinutes,
+      pdfOutputMode: this.settings.ocrOnlyOutputMode,
+      movePdfToSubfolder: Boolean(this.settings.ocrOnlyMovePdfToSubfolder),
+      keepOcrMarkdown: true,
+      extractImages: Boolean(this.settings.ocrOnlyExtractImages),
+      imageLimit: Math.max(0, Number(this.settings.ocrOnlyImageLimit) || 0),
+      imageMinSize: Math.max(0, Number(this.settings.ocrOnlyImageMinSize) || 0),
+      paginate: Boolean(this.settings.ocrOnlyPaginate),
+      mistralKeepHeadersFooters:
+        this.settings.ocrOnlyMistralKeepHeadersFooters !== false,
+      deleteMistralFile: Boolean(this.settings.ocrOnlyDeleteMistralFile),
+    };
+  }
+
+  getMarkdownTranslationRuntimeSettings() {
+    return {
+      ...this.settings,
+      baseUrl: this.settings.markdownBaseUrl || DEFAULT_SETTINGS.markdownBaseUrl,
+      model: this.settings.markdownModel || DEFAULT_SETTINGS.markdownModel,
+      thinkingEnabled: Boolean(this.settings.markdownThinkingEnabled),
+      reasoningEffort:
+        this.settings.markdownReasoningEffort || DEFAULT_SETTINGS.markdownReasoningEffort,
+      temperature: this.settings.markdownTemperature,
+      maxTokens: this.settings.markdownMaxTokens,
+      outputSuffix:
+        this.settings.markdownOutputSuffix || DEFAULT_SETTINGS.markdownOutputSuffix,
+      translationPrompt:
+        this.settings.markdownTranslationPrompt ||
+        DEFAULT_SETTINGS.markdownTranslationPrompt,
+    };
   }
 
   createPdfDocumentService() {
     return new PdfDocumentService();
   }
 
-  choosePdfRanges(file, pageCount) {
-    return new PdfRangeModal(this.app, file, pageCount).waitForResult();
+  choosePdfRanges(file, pageCount, options = {}) {
+    return new PdfRangeModal(this.app, file, pageCount, {
+      pdfBytes: options.pdfBytes,
+      onAutoDetect: ({ onProgress, isCancelled }) =>
+        this.detectPdfChapterRanges({
+          file,
+          pageCount,
+          pdfDocument: options.pdfDocument,
+          debugSession: options.debugSession,
+          onProgress,
+          isCancelled,
+        }),
+    }).waitForResult();
   }
 
-  createPdfSegmentState(segment, index, file) {
+  async detectPdfChapterRanges({
+    file,
+    pageCount,
+    pdfDocument,
+    debugSession,
+    onProgress = () => {},
+    isCancelled = () => false,
+  }) {
+    if (!pdfDocument) {
+      throw new Error("PDF 文档尚未准备好，无法自动识别目录");
+    }
+
+    const roundEnds = [15, 25, 35]
+      .map((end) => Math.min(end, pageCount))
+      .filter((end, index, values) => index === 0 || end !== values[index - 1]);
+    const pages = [];
+    let previousEnd = 0;
+    let lastReason = "没有找到足够的目录和正文页码信息";
+
+    for (let roundIndex = 0; roundIndex < roundEnds.length; roundIndex += 1) {
+      if (isCancelled()) {
+        throw new Error("自动划分已取消");
+      }
+      const end = roundEnds[roundIndex];
+      const start = previousEnd + 1;
+      onProgress(`正在 OCR 目录分析页 ${start}-${end}`);
+      const [segment] = await pdfDocument.createSegments([{ start, end }]);
+      const batchPages = await this.ocrChapterOutlineSegment({
+        segment,
+        file,
+        debugSession,
+        onProgress,
+      });
+      if (isCancelled()) {
+        throw new Error("自动划分已取消");
+      }
+      pages.push(...batchPages);
+      previousEnd = end;
+
+      const markedMarkdown = buildPageMarkedMarkdown(pages);
+      await this.updateDebugSession(debugSession, "chapter-outline-ocr-ready", {
+        round: roundIndex + 1,
+        analyzedRange: { start: 1, end },
+        pageMarkdown: markedMarkdown,
+      });
+      onProgress(`DeepSeek 正在分析目录（已读取 1-${end} 页）`);
+
+      const analyzed = await this.runStageWithRetries(
+        "DeepSeek 目录分析",
+        async (attempt) => {
+          const response = await this.requestChapterOutline(markedMarkdown, pageCount, end);
+          await this.updateDebugSession(debugSession, "chapter-outline-deepseek-response", {
+            round: roundIndex + 1,
+            attempt,
+            response,
+          });
+          const result = parseChapterOutlineResponse(response.content);
+          if (chapterOutlineStatus(result) === "ready") {
+            const built = buildChapterOutlineRanges(result, pageCount);
+            return {
+              result,
+              ranges: built.ranges,
+              buildWarnings: built.warnings,
+            };
+          }
+          return { result, ranges: null };
+        },
+        (label) => onProgress(label),
+        {
+          onAttemptFailure: (attempt, error) =>
+            this.updateDebugSession(debugSession, "chapter-outline-analysis-failed", {
+              round: roundIndex + 1,
+              attempt,
+              error: this.serializeError(error),
+            }),
+        },
+      );
+      if (isCancelled()) {
+        throw new Error("自动划分已取消");
+      }
+
+      if (analyzed.ranges) {
+        const modelWarnings = Array.isArray(analyzed.result.warnings)
+          ? analyzed.result.warnings.map(String)
+          : [];
+        const warnings = analyzed.buildWarnings || [];
+        await this.updateDebugSession(debugSession, "chapter-outline-completed", {
+          analyzedThroughPage: end,
+          pageMapping: analyzed.result.pageMapping || null,
+          chapters: analyzed.result.chapters || [],
+          backMatter: analyzed.result.backMatter || null,
+          ranges: analyzed.ranges,
+          warnings,
+          modelWarnings,
+        });
+        onProgress(
+          warnings.length > 0
+            ? String(warnings[0])
+            : `自动划分完成，共识别 ${analyzed.ranges.length} 个部分`,
+        );
+        return { ranges: analyzed.ranges, warnings };
+      }
+
+      lastReason = String(analyzed.result?.reason || lastReason);
+      if (end < roundEnds.at(-1)) {
+        onProgress(`信息不足，将继续读取 PDF 第 ${end + 1}-${roundEnds[roundIndex + 1]} 页`);
+      }
+    }
+
+    const error = new Error(`分析到 PDF 第 ${previousEnd} 页后仍无法自动划分：${lastReason}`);
+    await this.updateDebugSession(debugSession, "chapter-outline-failed", {
+      analyzedThroughPage: previousEnd,
+      error: this.serializeError(error),
+    });
+    throw error;
+  }
+
+  async ocrChapterOutlineSegment({ segment, file, debugSession, onProgress }) {
+    const analysisSettings = { ...this.settings, extractImages: false };
+    const service = this.createOcrService(analysisSettings);
+    const provider = analysisSettings.ocrProvider === "mineru" ? "mineru" : "mistral";
+    const providerName = provider === "mineru" ? "MinerU" : "Mistral";
+    const segmentName = `${sanitizePathSegment(file.basename, "PDF")}--目录分析--p${String(
+      segment.start,
+    ).padStart(4, "0")}-${String(segment.end).padStart(4, "0")}.pdf`;
+    const remoteFileIds = new Set();
+    let uploaded = null;
+
+    try {
+      uploaded = await this.runStageWithRetries(
+        "目录页上传",
+        async (attempt) => {
+          onProgress(`正在上传目录分析页 ${segment.start}-${segment.end}`);
+          try {
+            const result = await service.uploadPdf(segment.arrayBuffer, segmentName);
+            remoteFileIds.add(result.fileId);
+            await this.updateDebugSession(debugSession, "chapter-outline-uploaded", {
+              range: { start: segment.start, end: segment.end },
+              attempt,
+              provider,
+              remoteFileId: result.fileId,
+            });
+            return result;
+          } catch (error) {
+            if (error?.uploadedFileId) {
+              remoteFileIds.add(error.uploadedFileId);
+            }
+            throw error;
+          }
+        },
+        (label) => onProgress(label),
+      );
+
+      const response = await this.runStageWithRetries(
+        "目录页 OCR",
+        async (attempt) => {
+          onProgress(`${providerName} 正在 OCR 第 ${segment.start}-${segment.end} 页`);
+          const url = attempt === 1
+            ? uploaded.url
+            : await service.getSignedUrl(uploaded.fileId);
+          const result = await service.processOcr(url, {
+            onProgress: (status) => {
+              const count =
+                status.extractedPages !== null && status.totalPages !== null
+                  ? ` ${status.extractedPages}/${status.totalPages}`
+                  : "";
+              onProgress(`${providerName} 正在 OCR 第 ${segment.start}-${segment.end} 页${count}`);
+            },
+          });
+          this.validateOcrPageCount(result, segment, provider);
+          await this.updateDebugSession(debugSession, "chapter-outline-ocr-response", {
+            range: { start: segment.start, end: segment.end },
+            attempt,
+            response: this.sanitizeOcrResponseForDebug(result),
+          });
+          return result;
+        },
+        (label) => onProgress(label),
+      );
+      return this.chapterOutlinePagesFromResponse(response, segment, providerName);
+    } finally {
+      if (service.supportsRemoteDelete !== false) {
+        for (const fileId of remoteFileIds) {
+          try {
+            await this.runStageWithRetries(
+              "清理目录分析临时文件",
+              async () => {
+                const deletion = await service.deleteFile(fileId);
+                if (!deletion?.deleted) {
+                  throw new Error("OCR 服务返回了未删除状态");
+                }
+              },
+              () => {},
+            );
+          } catch (error) {
+            console.warn("Unable to clean up outline analysis file:", error);
+            await this.updateDebugSession(debugSession, "chapter-outline-cleanup-failed", {
+              remoteFileId: fileId,
+              error: this.serializeError(error),
+            });
+          }
+        }
+      }
+    }
+  }
+
+  chapterOutlinePagesFromResponse(response, segment, providerName) {
+    const expected = segment.end - segment.start + 1;
+    const candidates =
+      Array.isArray(response?.analysisPages) && response.analysisPages.length === expected
+        ? response.analysisPages
+        : Array.isArray(response?.pages) && response.pages.length === expected
+          ? response.pages
+          : null;
+    if (!candidates) {
+      throw new Error(`${providerName} OCR 结果没有提供可靠的逐页文本，无法计算 PDF 页码`);
+    }
+
+    const seen = new Set();
+    const pages = candidates.map((page, position) => {
+      const localIndex = Number.isInteger(page?.index) ? page.index : position;
+      if (localIndex < 0 || localIndex >= expected || seen.has(localIndex)) {
+        throw new Error(`${providerName} OCR 的页面索引无效或重复`);
+      }
+      seen.add(localIndex);
+      return {
+        pdfPage: segment.start + localIndex,
+        markdown: String(page?.markdown || ""),
+      };
+    });
+    if (seen.size !== expected) {
+      throw new Error(`${providerName} OCR 的逐页文本不完整`);
+    }
+    return pages;
+  }
+
+  async requestChapterOutline(markedMarkdown, pageCount, analyzedThroughPage) {
+    const endpoint = this.getChatCompletionsEndpoint();
+    const configuredMaxTokens = Math.max(1, Math.floor(Number(this.settings.maxTokens) || 8192));
+    const requestBody = {
+      model: this.settings.model.trim() || DEFAULT_SETTINGS.model,
+      messages: [
+        {
+          role: "system",
+          content: this.chapterOutlineSystemPrompt(),
+        },
+        {
+          role: "user",
+          content: [
+            `PDF 总页数：${pageCount}`,
+            `目前已 OCR PDF 第 1-${analyzedThroughPage} 页。`,
+            "下面每个 PDF_PAGE 标记都是 PDF 阅读器显示的物理页码：",
+            "",
+            markedMarkdown,
+          ].join("\n"),
+        },
+      ],
+      thinking: {
+        type: "disabled",
+      },
+      max_tokens: configuredMaxTokens,
+      stream: false,
+      temperature: 0.1,
+    };
+
+    const response = await requestUrl({
+      url: endpoint,
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${this.settings.apiKey.trim()}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(requestBody),
+      throw: false,
+    });
+    if (response.status < 200 || response.status >= 300) {
+      const apiMessage = response.json?.error?.message || response.text;
+      throw new Error(
+        `DeepSeek API 返回 ${response.status}${apiMessage ? `：${apiMessage}` : ""}`,
+      );
+    }
+    const choice = response.json?.choices?.[0];
+    const content = choice?.message?.content;
+    if (typeof content !== "string" || !content.trim()) {
+      throw new Error("DeepSeek 没有返回目录分析文本");
+    }
+    if (choice?.finish_reason !== "stop") {
+      throw new Error(`DeepSeek 目录分析输出不完整（finish_reason=${choice?.finish_reason || "missing"}）`);
+    }
+    return {
+      id: response.json?.id || null,
+      model: response.json?.model || requestBody.model,
+      finishReason: choice.finish_reason,
+      usage: response.json?.usage || null,
+      content,
+    };
+  }
+
+  chapterOutlineSystemPrompt() {
+    return `你是 PDF 目录结构提取器。你的任务不是翻译或计算完整分块，而是根据带有 PDF 物理页码标记的 OCR 文本，提取书籍目录、正文印刷页码与 PDF 物理页码的固定偏移、每一章的印刷起始页，以及最后一章之后内容的印刷起始页。插件会自行计算所有 PDF 分块的结束页。
+
+规则：
+1. PDF_PAGE 是 PDF 阅读器中的物理页码；目录里的数字通常是书中印刷页码，两者不能混淆。
+2. 必须找到足够证据证明已经进入采用正式阿拉伯数字页码的正文，并给出 pdfPage、printedPage、offset，满足 pdfPage - printedPage = offset。不能猜测。
+3. chapters 只列“章”级条目，忽略 Part、Exercises、1.1、1.2 等节级条目。number 必须是从 1 开始的连续整数；title 只写章名，不要重复写 Chapter 和章号；printedStartPage 必须直接抄录目录中的印刷起始页，不能换算成 PDF 页码。
+4. 如果目录明确给出最后一章之后的附录、参考文献、索引等第一个顶级条目的印刷起始页，写入 backMatter；否则 backMatter 必须为 null，并在 warnings 中说明。不要猜测。
+5. 不要输出每一章的结束页、PDF 起始页或 ranges；这些数值全部由插件根据 offset 和下一章起始页计算，以避免重复或遗漏。
+6. 即使目录列出的后续章节超过当前 PDF 总页数（文件可能是不完整的节选），也必须返回 status=ready 和完整的目录条目，并在 warnings 中说明；插件会自动删除不在当前文件中的后续章节并截止到 PDF 末页。
+7. 如果还不能确认正文页码偏移，status 返回 need_more。如果目录本身尚未读完，也返回 need_more。
+8. 只输出一个 JSON 对象，不要输出 Markdown 代码围栏、解释或额外文字。
+
+成功格式：
+{"status":"ready","reason":"","pageMapping":{"pdfPage":17,"printedPage":1,"offset":16},"chapters":[{"number":1,"title":"Entropy","printedStartPage":5},{"number":2,"title":"Divergence","printedStartPage":39}],"backMatter":{"title":"References and index","printedStartPage":385},"warnings":[]}
+
+信息不足格式：
+{"status":"need_more","reason":"说明还缺少什么证据","pageMapping":null,"chapters":[],"backMatter":null,"warnings":[]}`;
+  }
+
+  createPdfSegmentState(segment, index, file, ocrSettings = this.settings) {
     const segmentName = segment.isWholeDocument
       ? file.name
       : `${sanitizePathSegment(file.basename, "PDF")}--p${String(segment.start).padStart(
@@ -497,8 +1042,9 @@ class DeepSeekTranslatorPlugin extends Plugin {
       segment,
       index,
       segmentName,
-      ocrProvider: this.settings.ocrProvider === "mineru" ? "mineru" : "mistral",
-      ocrService: this.createOcrService(),
+      ocrProvider: ocrSettings.ocrProvider === "mineru" ? "mineru" : "mistral",
+      ocrSettings,
+      ocrService: this.createOcrService(ocrSettings),
       uploaded: false,
       remoteFileId: null,
       remoteDeleted: false,
@@ -523,6 +1069,7 @@ class DeepSeekTranslatorPlugin extends Plugin {
     pdfHash,
     updateProgress,
     debugSession,
+    includeTranslation = true,
   }) {
     const stages = [
       {
@@ -541,11 +1088,13 @@ class DeepSeekTranslatorPlugin extends Plugin {
             debugSession,
           ),
       },
-      {
+    ];
+    if (includeTranslation) {
+      stages.push({
         pending: (state) => !state.translationDone,
         run: (state) => this.translatePdfSegment(state, updateProgress, debugSession),
-      },
-    ];
+      });
+    }
 
     for (const stage of stages) {
       const pendingStates = states.filter(stage.pending);
@@ -646,7 +1195,7 @@ class DeepSeekTranslatorPlugin extends Plugin {
                 status.extractedPages !== null && status.totalPages !== null
                   ? ` ${status.extractedPages}/${status.totalPages}`
                   : "";
-              updateProgress(`${this.ocrProviderName()} OCR${count}`);
+              updateProgress(`${this.ocrProviderName(state.ocrSettings)} OCR${count}`);
             },
           });
           const debugResponse = this.sanitizeOcrResponseForDebug(response);
@@ -679,6 +1228,7 @@ class DeepSeekTranslatorPlugin extends Plugin {
           { update: () => updateProgress() },
           {
             pageNumberOffset: state.segment.start - 1,
+            settings: state.ocrSettings,
             existingImageLinks: state.imageLinks,
             onImageSaved: ({ key, path, embeddedLink }) => {
               state.imageLinks.set(key, { path, embeddedLink });
@@ -708,7 +1258,7 @@ class DeepSeekTranslatorPlugin extends Plugin {
       imagePaths: [...state.createdImagePaths],
     });
     updateProgress();
-    if (this.settings.deleteMistralFile && state.ocrService.supportsRemoteDelete !== false) {
+    if (state.ocrSettings.deleteMistralFile && state.ocrService.supportsRemoteDelete !== false) {
       await this.tryDeleteRemoteFile(state);
     }
   }
@@ -764,27 +1314,98 @@ class DeepSeekTranslatorPlugin extends Plugin {
 
   async runStageWithRetries(stageName, operation, updateProgress, options = {}) {
     let lastError;
-    for (let attempt = 1; attempt <= MAX_STAGE_ATTEMPTS; attempt += 1) {
+    let attemptsUsed = 0;
+    for (let attempt = 1; attempt <= MAX_RATE_LIMIT_ATTEMPTS; attempt += 1) {
+      attemptsUsed = attempt;
       try {
         return await operation(attempt);
       } catch (error) {
         lastError = error;
         await options.onAttemptFailure?.(attempt, error);
-        if (attempt >= MAX_STAGE_ATTEMPTS) {
+        const rateLimited = this.isRateLimitError(error);
+        const maxAttempts = rateLimited ? MAX_RATE_LIMIT_ATTEMPTS : MAX_STAGE_ATTEMPTS;
+        if (attempt >= maxAttempts) {
           break;
         }
-        updateProgress(`${stageName}自动重试 ${attempt + 1}/${MAX_STAGE_ATTEMPTS}`);
-        await this.waitBeforeRetry(attempt);
+        const waitMs = rateLimited
+          ? this.getRateLimitRetryDelayMs(error, attempt)
+          : this.getTransientRetryDelayMs(error, attempt);
+        const waitSeconds = Math.max(1, Math.ceil(waitMs / 1000));
+        updateProgress(
+          rateLimited
+            ? `${stageName}触发 API 速率限制，等待 ${waitSeconds} 秒后重试 ${attempt + 1}/${maxAttempts}`
+            : `${stageName}自动重试 ${attempt + 1}/${maxAttempts}`,
+        );
+        await this.waitBeforeRetry(attempt, waitMs);
       }
     }
     throw new Error(
-      `${stageName}连续 ${MAX_STAGE_ATTEMPTS} 次失败：${this.getErrorMessage(lastError)}`,
+      `${stageName}连续 ${attemptsUsed} 次失败：${this.getErrorMessage(lastError)}`,
       { cause: lastError },
     );
   }
 
-  waitBeforeRetry(attempt) {
-    return new Promise((resolve) => globalThis.setTimeout(resolve, attempt * 750));
+  waitBeforeRetry(attempt, delayMs = null) {
+    const waitMs = Number.isFinite(delayMs) ? delayMs : attempt * 750;
+    return new Promise((resolve) => globalThis.setTimeout(resolve, Math.max(0, waitMs)));
+  }
+
+  isRateLimitError(error) {
+    return this.getErrorStatus(error) === 429 || /rate.?limit|too many requests|速率限制/i.test(
+      this.getErrorMessage(error),
+    );
+  }
+
+  getTransientRetryDelayMs(error, attempt) {
+    const status = this.getErrorStatus(error);
+    if ([408, 409, 425, 500, 502, 503, 504].includes(status)) {
+      return Math.min(30000, 2000 * (2 ** (attempt - 1))) + Math.floor(Math.random() * 500);
+    }
+    return attempt * 750;
+  }
+
+  getRateLimitRetryDelayMs(error, attempt) {
+    const retryAfterMs = this.getRetryAfterMs(error);
+    if (Number.isFinite(retryAfterMs) && retryAfterMs > 0) {
+      return Math.min(10 * 60 * 1000, retryAfterMs) + Math.floor(Math.random() * 1000);
+    }
+    return Math.min(5 * 60 * 1000, DEFAULT_RATE_LIMIT_WAIT_MS * (2 ** (attempt - 1))) +
+      Math.floor(Math.random() * 2000);
+  }
+
+  getErrorStatus(error) {
+    for (let current = error, depth = 0; current && depth < 6; depth += 1) {
+      const status = Number(
+        current.status ?? current.statusCode ?? current.response?.status ?? current.rawResponse?.status,
+      );
+      if (Number.isFinite(status) && status > 0) {
+        return status;
+      }
+      current = current.cause;
+    }
+    const match = this.getErrorMessage(error).match(/(?:^|\D)(429|5\d\d)(?:\D|$)/);
+    return match ? Number(match[1]) : null;
+  }
+
+  getRetryAfterMs(error) {
+    for (let current = error, depth = 0; current && depth < 6; depth += 1) {
+      const headers = current.headers || current.response?.headers || current.rawResponse?.headers;
+      const value = typeof headers?.get === "function"
+        ? headers.get("retry-after")
+        : headers?.["retry-after"] ?? headers?.["Retry-After"];
+      if (value !== undefined && value !== null) {
+        const seconds = Number(value);
+        if (Number.isFinite(seconds)) {
+          return Math.max(0, seconds * 1000);
+        }
+        const dateMs = Date.parse(String(value));
+        if (Number.isFinite(dateMs)) {
+          return Math.max(0, dateMs - Date.now());
+        }
+      }
+      current = current.cause;
+    }
+    return null;
   }
 
   async ensurePdfApiConnections(progress, debugSession) {
@@ -827,6 +1448,50 @@ class DeepSeekTranslatorPlugin extends Plugin {
     }
   }
 
+  async ensureOcrOnlyApiConnection(progress, debugSession, ocrSettings) {
+    while (true) {
+      const providerName = this.ocrProviderName(ocrSettings);
+      progress.update(`检查 ${providerName} API 连接`);
+      const ocrService = this.createOcrService(ocrSettings);
+      try {
+        await this.runStageWithRetries(
+          `${providerName} 连接检查`,
+          () => ocrService.checkConnection(),
+          (label) => progress.update(`检查 API 连接｜${label}`),
+        );
+        await this.updateDebugSession(debugSession, "api-preflight", {
+          results: [{ service: providerName, status: "fulfilled", error: null }],
+        });
+        progress.update("OCR API 连接正常");
+        return true;
+      } catch (error) {
+        const failure = {
+          service: providerName,
+          status: "rejected",
+          error: this.serializeError(error),
+        };
+        await this.updateDebugSession(debugSession, "api-preflight", {
+          results: [failure],
+        });
+        const action = await new TaskFailureModal(
+          this.app,
+          `任务尚未开始，${providerName} API 连接检查失败。`,
+          [`${providerName}：${failure.error?.message || "未知错误"}`],
+          {
+            retryDescription: `重试会再次检查 ${providerName} 的网络和密钥。`,
+            abandonDescription:
+              "放弃会取消任务；此时尚未上传 PDF，也没有创建 OCR 图片。关闭此窗口也视为放弃。",
+          },
+        ).waitForResult();
+        if (action !== "retry") {
+          new Notice("已取消 OCR，尚未上传任何文件。", 6000);
+          return false;
+        }
+        await this.updateDebugSession(debugSession, "api-preflight-user-retry");
+      }
+    }
+  }
+
   askApiConnectionFailureAction(failures) {
     return new TaskFailureModal(
       this.app,
@@ -852,6 +1517,23 @@ class DeepSeekTranslatorPlugin extends Plugin {
     );
     const isMinerU = this.settings.ocrProvider === "mineru";
     return new TaskFailureModal(this.app, summary, details, {
+      abandonDescription: isMinerU
+        ? "放弃会删除本次任务创建的本地图片。MinerU 未提供任务删除接口，已经提交的远程解析任务无法由插件主动删除；关闭此窗口也视为放弃。"
+        : "放弃会删除本次任务创建的图片，并清理尚存的 Mistral 临时文件。关闭此窗口也视为放弃。",
+    }).waitForResult();
+  }
+
+  askOcrOnlyFailureAction(states, failures, ocrSettings) {
+    const uploaded = states.filter((state) => state.uploaded).length;
+    const ocrDone = states.filter((state) => state.ocrDone).length;
+    const summary = `上传 ${uploaded}/${states.length}｜OCR ${ocrDone}/${states.length}。自动重试后仍有 ${failures.length} 个分块未完成。`;
+    const details = failures.map(({ result, state }) =>
+      `第 ${state.index + 1} 部分（${state.segment.start}-${state.segment.end} 页）：${this.getErrorMessage(result.reason)}`,
+    );
+    const isMinerU = ocrSettings.ocrProvider === "mineru";
+    return new TaskFailureModal(this.app, summary, details, {
+      retryDescription:
+        "重试会保留已经完成的上传、OCR 文本和图片，只继续未成功的步骤。",
       abandonDescription: isMinerU
         ? "放弃会删除本次任务创建的本地图片。MinerU 未提供任务删除接口，已经提交的远程解析任务无法由插件主动删除；关闭此窗口也视为放弃。"
         : "放弃会删除本次任务创建的图片，并清理尚存的 Mistral 临时文件。关闭此窗口也视为放弃。",
@@ -947,7 +1629,7 @@ class DeepSeekTranslatorPlugin extends Plugin {
     };
   }
 
-  createDebugSession(taskType, file) {
+  createDebugSession(taskType, file, taskSettings = this.settings) {
     if (!this.settings.debugMode || !this.app.vault.adapter?.write) {
       return null;
     }
@@ -962,22 +1644,22 @@ class DeepSeekTranslatorPlugin extends Plugin {
       endedAt: null,
       file: { path: file.path, name: file.name },
       settings: {
-        deepSeekBaseUrl: this.settings.baseUrl,
-        deepSeekModel: this.settings.model,
-        thinkingEnabled: this.settings.thinkingEnabled,
-        reasoningEffort: this.settings.reasoningEffort,
-        maxTokens: this.settings.maxTokens,
-        ocrProvider: this.settings.ocrProvider,
-        mistralModel: this.settings.mistralModel,
-        mineruBaseUrl: this.settings.mineruBaseUrl,
-        mineruModelVersion: this.settings.mineruModelVersion,
-        mineruLanguage: this.settings.mineruLanguage,
-        mineruForceOcr: this.settings.mineruForceOcr,
-        mineruEnableFormula: this.settings.mineruEnableFormula,
-        mineruEnableTable: this.settings.mineruEnableTable,
-        extractImages: this.settings.extractImages,
-        paginate: this.settings.paginate,
-        translationPrompt: this.settings.translationPrompt,
+        deepSeekBaseUrl: taskSettings.baseUrl,
+        deepSeekModel: taskSettings.model,
+        thinkingEnabled: taskSettings.thinkingEnabled,
+        reasoningEffort: taskSettings.reasoningEffort,
+        maxTokens: taskSettings.maxTokens,
+        ocrProvider: taskSettings.ocrProvider,
+        mistralModel: taskSettings.mistralModel,
+        mineruBaseUrl: taskSettings.mineruBaseUrl,
+        mineruModelVersion: taskSettings.mineruModelVersion,
+        mineruLanguage: taskSettings.mineruLanguage,
+        mineruForceOcr: taskSettings.mineruForceOcr,
+        mineruEnableFormula: taskSettings.mineruEnableFormula,
+        mineruEnableTable: taskSettings.mineruEnableTable,
+        extractImages: taskSettings.extractImages,
+        paginate: taskSettings.paginate,
+        translationPrompt: taskSettings.translationPrompt,
       },
       metadata: {},
       segments: [],
@@ -1120,6 +1802,12 @@ class DeepSeekTranslatorPlugin extends Plugin {
             })),
           }))
         : [],
+      analysisPages: Array.isArray(response?.analysisPages)
+        ? response.analysisPages.map((page) => ({
+            index: page.index,
+            markdown: page.markdown || "",
+          }))
+        : [],
     };
   }
 
@@ -1198,8 +1886,8 @@ class DeepSeekTranslatorPlugin extends Plugin {
     return false;
   }
 
-  requireOcrProviderKey() {
-    return this.settings.ocrProvider === "mineru"
+  requireOcrProviderKey(settings = this.settings) {
+    return settings.ocrProvider === "mineru"
       ? this.requireMinerUKey()
       : this.requireMistralKey();
   }
@@ -1209,27 +1897,28 @@ class DeepSeekTranslatorPlugin extends Plugin {
   }
 
   async requestTranslation(markdown, options = {}) {
-    const endpoint = this.getChatCompletionsEndpoint();
-    const temperature = this.clampNumber(this.settings.temperature, 0, 2, 0.2);
-    const maxTokens = Math.max(1, Math.floor(Number(this.settings.maxTokens) || 8192));
+    const settings = options.settings || this.settings;
+    const endpoint = this.getChatCompletionsEndpoint(settings);
+    const temperature = this.clampNumber(settings.temperature, 0, 2, 0.2);
+    const maxTokens = Math.max(1, Math.floor(Number(settings.maxTokens) || 8192));
     const requestBody = {
-      model: this.settings.model.trim() || DEFAULT_SETTINGS.model,
+      model: settings.model.trim() || DEFAULT_SETTINGS.model,
       messages: [
         {
           role: "system",
-          content: this.settings.translationPrompt.trim() || DEFAULT_SETTINGS.translationPrompt,
+          content: settings.translationPrompt.trim() || DEFAULT_SETTINGS.translationPrompt,
         },
         { role: "user", content: markdown },
       ],
       thinking: {
-        type: this.settings.thinkingEnabled ? "enabled" : "disabled",
+        type: settings.thinkingEnabled ? "enabled" : "disabled",
       },
       max_tokens: maxTokens,
       stream: false,
     };
 
-    if (this.settings.thinkingEnabled) {
-      requestBody.reasoning_effort = this.settings.reasoningEffort === "max" ? "max" : "high";
+    if (settings.thinkingEnabled) {
+      requestBody.reasoning_effort = settings.reasoningEffort === "max" ? "max" : "high";
     } else {
       requestBody.temperature = temperature;
     }
@@ -1275,9 +1964,9 @@ class DeepSeekTranslatorPlugin extends Plugin {
     return content;
   }
 
-  async checkDeepSeekConnection() {
+  async checkDeepSeekConnection(settings = this.settings) {
     const response = await requestUrl({
-      url: `${this.getDeepSeekApiRoot()}/models`,
+      url: `${this.getDeepSeekApiRoot(settings)}/models`,
       method: "GET",
       headers: {
         Authorization: `Bearer ${this.settings.apiKey.trim()}`,
@@ -1294,28 +1983,28 @@ class DeepSeekTranslatorPlugin extends Plugin {
     if (!Array.isArray(models)) {
       throw new Error("DeepSeek 模型列表响应无效");
     }
-    const configuredModel = this.settings.model.trim() || DEFAULT_SETTINGS.model;
+    const configuredModel = settings.model.trim() || DEFAULT_SETTINGS.model;
     if (models.length > 0 && !models.some((model) => model?.id === configuredModel)) {
       throw new Error(`DeepSeek 当前账户不可用模型：${configuredModel}`);
     }
     return true;
   }
 
-  getDeepSeekApiRoot() {
-    const baseUrl = (this.settings.baseUrl || DEFAULT_SETTINGS.baseUrl)
+  getDeepSeekApiRoot(settings = this.settings) {
+    const baseUrl = (settings.baseUrl || DEFAULT_SETTINGS.baseUrl)
       .trim()
       .replace(/\/+$/, "");
     return baseUrl.replace(/\/chat\/completions$/, "");
   }
 
-  getChatCompletionsEndpoint() {
-    const baseUrl = (this.settings.baseUrl || DEFAULT_SETTINGS.baseUrl).trim().replace(/\/+$/, "");
+  getChatCompletionsEndpoint(settings = this.settings) {
+    const baseUrl = (settings.baseUrl || DEFAULT_SETTINGS.baseUrl).trim().replace(/\/+$/, "");
     return baseUrl.endsWith("/chat/completions") ? baseUrl : `${baseUrl}/chat/completions`;
   }
 
-  getAvailableMarkdownTranslationPath(sourceFile) {
+  getAvailableMarkdownTranslationPath(sourceFile, settings = this.settings) {
     const folderPath = this.parentPath(sourceFile.path);
-    const suffix = this.sanitizeSuffix(this.settings.outputSuffix);
+    const suffix = this.sanitizeSuffix(settings.outputSuffix);
     const baseName = `${sourceFile.basename}${suffix}`;
 
     for (let index = 0; ; index += 1) {
@@ -1355,6 +2044,43 @@ class DeepSeekTranslatorPlugin extends Plugin {
     }
   }
 
+  getAvailableOcrOnlyOutputPlan(pdfFile, ocrSettings) {
+    const parent = this.parentPath(pdfFile.path);
+    const originalStem = sanitizePathSegment(pdfFile.basename, "PDF");
+    const suffix = sanitizePathSegment(
+      this.settings.ocrOnlyOutputSuffix || DEFAULT_SETTINGS.ocrOnlyOutputSuffix,
+      DEFAULT_SETTINGS.ocrOnlyOutputSuffix,
+    );
+    const useSubfolder = ocrSettings.pdfOutputMode === "subfolder";
+
+    for (let index = 0; ; index += 1) {
+      const stem = index === 0 ? originalStem : `${originalStem} ${index + 1}`;
+      const outputFolder = useSubfolder ? this.joinPath(parent, stem) : parent;
+      const ocrPath = this.joinPath(outputFolder, `${stem}${suffix}.md`);
+      if (useSubfolder) {
+        if (!this.app.vault.getAbstractFileByPath(outputFolder)) {
+          return {
+            outputFolder,
+            stem,
+            ocrPath,
+            translationPath: ocrPath,
+            useSubfolder,
+          };
+        }
+        continue;
+      }
+      if (!this.app.vault.getAbstractFileByPath(ocrPath)) {
+        return {
+          outputFolder,
+          stem,
+          ocrPath,
+          translationPath: ocrPath,
+          useSubfolder,
+        };
+      }
+    }
+  }
+
   async ensureOutputFolder(folderPath) {
     if (!folderPath) {
       return;
@@ -1370,10 +2096,11 @@ class DeepSeekTranslatorPlugin extends Plugin {
   }
 
   async materializeOcrResult(pages, pdfFile, outputPlan, pdfHash, progress, options = {}) {
-    const referenceSourcePath = this.settings.keepOcrMarkdown
+    const settings = options.settings || this.settings;
+    const referenceSourcePath = settings.keepOcrMarkdown
       ? outputPlan.ocrPath
       : outputPlan.translationPath;
-    const imageCount = this.settings.extractImages
+    const imageCount = settings.extractImages
       ? pages.reduce(
           (total, page) => total + (page.images || []).filter((image) => image.imageBase64).length,
           0,
@@ -1391,7 +2118,7 @@ class DeepSeekTranslatorPlugin extends Plugin {
         pageNumberOffset + (Number.isFinite(page.index) ? page.index + 1 : pageOffset + 1);
       let markdown = page.markdown || "";
 
-      if (this.settings.extractImages) {
+      if (settings.extractImages) {
         const images = page.images || [];
         for (let imageOffset = 0; imageOffset < images.length; imageOffset += 1) {
           const image = images[imageOffset];
@@ -1463,7 +2190,7 @@ class DeepSeekTranslatorPlugin extends Plugin {
       progress.update("没有需要保存的 OCR 图片");
     }
 
-    const separator = this.settings.paginate ? "\n\n---\n\n" : "\n\n";
+    const separator = settings.paginate ? "\n\n---\n\n" : "\n\n";
     return {
       markdown: pageMarkdowns.join(separator).trim() + "\n",
       savedImageCount,
@@ -1479,8 +2206,12 @@ class DeepSeekTranslatorPlugin extends Plugin {
     return `${prefix}--${pdfHash}--p${page}--${imageStem}.${extension}`;
   }
 
-  async movePdfIfRequested(pdfFile, outputPlan) {
-    if (!outputPlan.useSubfolder || !this.settings.movePdfToSubfolder) {
+  async movePdfIfRequested(
+    pdfFile,
+    outputPlan,
+    moveToSubfolder = this.settings.movePdfToSubfolder,
+  ) {
+    if (!outputPlan.useSubfolder || !moveToSubfolder) {
       return;
     }
     const targetPath = this.joinPath(outputPlan.outputFolder, pdfFile.name);
@@ -1531,16 +2262,19 @@ class DeepSeekTranslatorSettingTab extends PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
+    this.openSections = new Set();
   }
 
   display() {
-    const { containerEl } = this;
+    this.captureOpenSections();
+    const settingsRoot = this.containerEl;
+    let containerEl = settingsRoot;
     containerEl.empty();
     containerEl.createEl("h2", { text: "Pdf translate to markdown" });
     containerEl.createEl("h3", { text: "API 密钥" });
 
     containerEl.createEl("p", {
-      text: "使用教程：先按下面的步骤创建并填写 API 密钥。配置完成后，可在文件列表中右键 Markdown 直接翻译，或右键 PDF 执行 OCR 并翻译。",
+      text: "使用教程：先按下面的步骤创建并填写 API 密钥。配置完成后，可在文件列表中右键 Markdown 翻译，或右键 PDF 选择仅转换、转换并翻译。",
     });
     const guide = containerEl.createEl("ol");
     const deepSeekGuide = guide.createEl("li");
@@ -1572,7 +2306,7 @@ class DeepSeekTranslatorSettingTab extends PluginSettingTab {
 
     const usageGuide = guide.createEl("li");
     usageGuide.appendText(
-      "普通 Markdown 翻译只需要 DeepSeek 密钥；PDF 一键翻译还需要当前所选 OCR 服务的密钥或 Token。其余设置通常可保持默认。",
+      "翻译 Markdown 只需要 DeepSeek 密钥；PDF 转换并翻译需要 DeepSeek 和所选解析服务；仅将 PDF 转为 Markdown 只需要所选解析服务。其余设置通常可保持默认。",
     );
 
     this.addPasswordSetting(
@@ -1581,6 +2315,27 @@ class DeepSeekTranslatorSettingTab extends PluginSettingTab {
       "用于翻译 Markdown。支持 Secret Storage 时会安全迁移，不再写入 data.json。",
       "apiKey",
     );
+    this.addPasswordSetting(
+      containerEl,
+      "Mistral API 密钥",
+      "用于 Mistral OCR。不会读取或复用其他插件中的密钥。",
+      "mistralApiKey",
+    );
+    this.addPasswordSetting(
+      containerEl,
+      "MinerU API Token",
+      "用于 MinerU 精准解析 API。支持 Secret Storage 时不会写入 data.json。",
+      "mineruApiKey",
+    );
+
+    containerEl.createEl("h3", { text: "功能设置" });
+    containerEl = this.createCollapsibleSection(
+      settingsRoot,
+      "pdf-translate",
+      "PDF 转为 Markdown 并翻译",
+      "先用 Mistral 或 MinerU 转换，再用 DeepSeek 翻译；支持手动或按目录分块。",
+    );
+    containerEl.createEl("h4", { text: "流程与输出" });
     new Setting(containerEl)
       .setName("PDF OCR 服务")
       .setDesc("选择 PDF 上传和 Markdown 解析所使用的服务。DeepSeek 始终负责翻译。")
@@ -1595,23 +2350,7 @@ class DeepSeekTranslatorSettingTab extends PluginSettingTab {
           }),
       );
 
-    if (this.plugin.settings.ocrProvider === "mineru") {
-      this.addPasswordSetting(
-        containerEl,
-        "MinerU API Token",
-        "用于 MinerU 精准解析 API。支持 Secret Storage 时不会写入 data.json。",
-        "mineruApiKey",
-      );
-    } else {
-      this.addPasswordSetting(
-        containerEl,
-        "Mistral API 密钥",
-        "用于 Mistral OCR。不会读取或复用其他插件中的密钥。",
-        "mistralApiKey",
-      );
-    }
-
-    containerEl.createEl("h3", { text: "PDF 输出设置" });
+    containerEl.createEl("h4", { text: "PDF 输出设置" });
     new Setting(containerEl)
       .setName("结果输出位置")
       .setDesc("图片始终遵循 Obsidian 的默认附件路径。")
@@ -1655,7 +2394,7 @@ class DeepSeekTranslatorSettingTab extends PluginSettingTab {
           .onChange((value) => this.updateSetting("outputSuffix", value)),
       );
 
-    containerEl.createEl("h3", { text: "DeepSeek 设置" });
+    containerEl.createEl("h4", { text: "DeepSeek 设置" });
     new Setting(containerEl)
       .setName("API 地址")
       .setDesc("填写基础地址或完整的 /chat/completions 地址。")
@@ -1728,7 +2467,7 @@ class DeepSeekTranslatorSettingTab extends PluginSettingTab {
       });
 
     const usingMinerU = this.plugin.settings.ocrProvider === "mineru";
-    containerEl.createEl("h3", { text: usingMinerU ? "MinerU 解析设置" : "Mistral OCR 设置" });
+    containerEl.createEl("h4", { text: usingMinerU ? "MinerU 解析设置" : "Mistral OCR 设置" });
     if (usingMinerU) {
       new Setting(containerEl)
         .setName("API 地址")
@@ -1822,6 +2561,17 @@ class DeepSeekTranslatorSettingTab extends PluginSettingTab {
             .setValue(this.plugin.settings.mistralModel)
             .onChange((value) => this.updateSetting("mistralModel", value.trim())),
         );
+
+      new Setting(containerEl)
+        .setName("保留页眉和页脚")
+        .setDesc(
+          "关闭后，Mistral 会识别页眉页脚并将其从正文 Markdown 中移除；该能力要求 OCR 2512 或更新模型。",
+        )
+        .addToggle((toggle) =>
+          toggle
+            .setValue(this.plugin.settings.mistralKeepHeadersFooters !== false)
+            .onChange((value) => this.updateSetting("mistralKeepHeadersFooters", value)),
+        );
     }
 
     new Setting(containerEl)
@@ -1893,6 +2643,31 @@ class DeepSeekTranslatorSettingTab extends PluginSettingTab {
         );
     }
 
+    containerEl.createEl("h4", { text: "翻译提示词" });
+    this.renderPromptSetting(
+      containerEl,
+      "translationPrompt",
+      DEFAULT_SETTINGS.translationPrompt,
+    );
+
+    containerEl = this.createCollapsibleSection(
+      settingsRoot,
+      "markdown-translate",
+      "翻译 Markdown",
+      "直接翻译现有 Markdown 文件；此处的 DeepSeek 参数和提示词独立于 PDF 翻译。",
+    );
+    this.renderMarkdownTranslationSettings(containerEl);
+
+    containerEl = this.createCollapsibleSection(
+      settingsRoot,
+      "ocr-only",
+      "仅将 PDF 转为 Markdown",
+      "固定按每 100 页一块并行转换后合并，不调用 DeepSeek。",
+    );
+    this.renderOcrOnlySettings(containerEl);
+
+    containerEl = settingsRoot;
+
     containerEl.createEl("h3", { text: "调试" });
     new Setting(containerEl)
       .setName("调试模式")
@@ -1904,19 +2679,6 @@ class DeepSeekTranslatorSettingTab extends PluginSettingTab {
           .setValue(Boolean(this.plugin.settings.debugMode))
           .onChange((value) => this.updateSetting("debugMode", value)),
       );
-
-    containerEl.createEl("h3", { text: "翻译提示词" });
-    new Setting(containerEl)
-      .setName("系统提示词")
-      .setDesc("Markdown 原文会作为下一条用户消息完整提交。")
-      .addTextArea((text) => {
-        text
-          .setPlaceholder(DEFAULT_SETTINGS.translationPrompt)
-          .setValue(this.plugin.settings.translationPrompt)
-          .onChange((value) => this.updateSetting("translationPrompt", value));
-        text.inputEl.rows = 14;
-        text.inputEl.addClass("deepseek-translator-prompt");
-      });
 
     containerEl.createEl("h3", { text: "更新" });
     const release = this.plugin.latestRelease;
@@ -1949,6 +2711,360 @@ class DeepSeekTranslatorSettingTab extends PluginSettingTab {
             }
           }),
       );
+    }
+  }
+
+  renderOcrOnlySettings(containerEl) {
+    const settings = this.plugin.settings;
+    const usingMinerU = settings.ocrOnlyProvider === "mineru";
+    containerEl.createEl("h4", { text: "流程与输出" });
+    containerEl.createEl("p", {
+      text: "右键 PDF 选择“仅转为 Markdown”后，插件会固定按每 100 页一块并行处理并合并结果，不调用 DeepSeek。这里的选项独立于“PDF 转为 Markdown 并翻译”。",
+    });
+
+    new Setting(containerEl)
+      .setName("OCR 服务")
+      .setDesc("仅转换功能使用的解析服务。API 密钥在设置页顶部统一填写。")
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("mistral", "Mistral OCR")
+          .addOption("mineru", "MinerU 精准解析")
+          .setValue(settings.ocrOnlyProvider)
+          .onChange(async (value) => {
+            await this.updateSetting("ocrOnlyProvider", value);
+            this.display();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("结果输出位置")
+      .setDesc("图片仍遵循 Obsidian 的默认附件路径。")
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("same-folder", "PDF 所在文件夹")
+          .addOption("subfolder", "在 PDF 所在文件夹中新建与 PDF 同名子文件夹")
+          .setValue(settings.ocrOnlyOutputMode)
+          .onChange(async (value) => {
+            await this.updateSetting("ocrOnlyOutputMode", value);
+            this.display();
+          }),
+      );
+
+    if (settings.ocrOnlyOutputMode === "subfolder") {
+      new Setting(containerEl)
+        .setName("将原 PDF 移入结果文件夹")
+        .setDesc("仅在全部 OCR 成功并写入 Markdown 后移动。")
+        .addToggle((toggle) =>
+          toggle
+            .setValue(Boolean(settings.ocrOnlyMovePdfToSubfolder))
+            .onChange((value) => this.updateSetting("ocrOnlyMovePdfToSubfolder", value)),
+        );
+    }
+
+    new Setting(containerEl)
+      .setName("输出文件名后缀")
+      .setDesc("例如 paper.pdf 默认输出 paper_OCR.md。")
+      .addText((text) =>
+        text
+          .setPlaceholder(DEFAULT_SETTINGS.ocrOnlyOutputSuffix)
+          .setValue(settings.ocrOnlyOutputSuffix)
+          .onChange((value) => this.updateSetting("ocrOnlyOutputSuffix", value)),
+      );
+
+    if (usingMinerU) {
+      new Setting(containerEl)
+        .setName("API 地址")
+        .setDesc("仅转换功能使用的 MinerU API v4 基础地址。")
+        .addText((text) =>
+          text
+            .setPlaceholder(DEFAULT_SETTINGS.ocrOnlyMineruBaseUrl)
+            .setValue(settings.ocrOnlyMineruBaseUrl)
+            .onChange((value) => this.updateSetting("ocrOnlyMineruBaseUrl", value.trim())),
+        );
+      new Setting(containerEl)
+        .setName("解析模型")
+        .addDropdown((dropdown) =>
+          dropdown
+            .addOption("vlm", "VLM（推荐）")
+            .addOption("pipeline", "Pipeline")
+            .setValue(settings.ocrOnlyMineruModelVersion)
+            .onChange((value) => this.updateSetting("ocrOnlyMineruModelVersion", value)),
+        );
+      new Setting(containerEl)
+        .setName("文档语言")
+        .setDesc("英文资料使用 en，中文资料使用 ch。")
+        .addText((text) =>
+          text
+            .setPlaceholder("en")
+            .setValue(settings.ocrOnlyMineruLanguage)
+            .onChange((value) => this.updateSetting("ocrOnlyMineruLanguage", value.trim())),
+        );
+      new Setting(containerEl)
+        .setName("强制 OCR")
+        .setDesc("扫描版 PDF 建议开启。")
+        .addToggle((toggle) =>
+          toggle
+            .setValue(Boolean(settings.ocrOnlyMineruForceOcr))
+            .onChange((value) => this.updateSetting("ocrOnlyMineruForceOcr", value)),
+        );
+      new Setting(containerEl)
+        .setName("识别公式")
+        .addToggle((toggle) =>
+          toggle
+            .setValue(settings.ocrOnlyMineruEnableFormula !== false)
+            .onChange((value) => this.updateSetting("ocrOnlyMineruEnableFormula", value)),
+        );
+      new Setting(containerEl)
+        .setName("识别表格")
+        .addToggle((toggle) =>
+          toggle
+            .setValue(settings.ocrOnlyMineruEnableTable !== false)
+            .onChange((value) => this.updateSetting("ocrOnlyMineruEnableTable", value)),
+        );
+      new Setting(containerEl)
+        .setName("轮询间隔（秒）")
+        .addText((text) => {
+          text
+            .setValue(String(settings.ocrOnlyMineruPollIntervalSeconds))
+            .onChange((value) =>
+              this.updateFiniteNumber("ocrOnlyMineruPollIntervalSeconds", value, 1, 60),
+            );
+          text.inputEl.type = "number";
+          text.inputEl.min = "1";
+          text.inputEl.max = "60";
+        });
+      new Setting(containerEl)
+        .setName("单块等待上限（分钟）")
+        .addText((text) => {
+          text
+            .setValue(String(settings.ocrOnlyMineruTimeoutMinutes))
+            .onChange((value) =>
+              this.updatePositiveInteger("ocrOnlyMineruTimeoutMinutes", value),
+            );
+          text.inputEl.type = "number";
+          text.inputEl.min = "1";
+        });
+    } else {
+      new Setting(containerEl)
+        .setName("OCR 模型")
+        .setDesc("可填写 Mistral OCR API 支持的其他模型名称。")
+        .addText((text) =>
+          text
+            .setPlaceholder(DEFAULT_SETTINGS.ocrOnlyMistralModel)
+            .setValue(settings.ocrOnlyMistralModel)
+            .onChange((value) => this.updateSetting("ocrOnlyMistralModel", value.trim())),
+        );
+
+      new Setting(containerEl)
+        .setName("保留页眉和页脚")
+        .setDesc(
+          "关闭后，Mistral 会识别页眉页脚并将其从正文 Markdown 中移除；该能力要求 OCR 2512 或更新模型。",
+        )
+        .addToggle((toggle) =>
+          toggle
+            .setValue(settings.ocrOnlyMistralKeepHeadersFooters !== false)
+            .onChange((value) =>
+              this.updateSetting("ocrOnlyMistralKeepHeadersFooters", value),
+            ),
+        );
+    }
+
+    new Setting(containerEl)
+      .setName("提取图片")
+      .setDesc(`将 ${usingMinerU ? "MinerU" : "Mistral"} 返回的图片写入 Obsidian 默认附件路径。`)
+      .addToggle((toggle) =>
+        toggle.setValue(Boolean(settings.ocrOnlyExtractImages)).onChange(async (value) => {
+          await this.updateSetting("ocrOnlyExtractImages", value);
+          this.display();
+        }),
+      );
+
+    if (settings.ocrOnlyExtractImages) {
+      new Setting(containerEl)
+        .setName("图片数量上限")
+        .setDesc("每个 API 分块的上限；0 表示不限制。")
+        .addText((text) => {
+          text
+            .setValue(String(settings.ocrOnlyImageLimit))
+            .onChange((value) => this.updateNonNegativeInteger("ocrOnlyImageLimit", value));
+          text.inputEl.type = "number";
+          text.inputEl.min = "0";
+        });
+      new Setting(containerEl)
+        .setName("图片最小尺寸")
+        .setDesc("宽和高的最小像素值；0 表示不限制。")
+        .addText((text) => {
+          text
+            .setValue(String(settings.ocrOnlyImageMinSize))
+            .onChange((value) => this.updateNonNegativeInteger("ocrOnlyImageMinSize", value));
+          text.inputEl.type = "number";
+          text.inputEl.min = "0";
+        });
+    }
+
+    new Setting(containerEl)
+      .setName("页面之间添加分隔线")
+      .setDesc(
+        usingMinerU
+          ? "MinerU 的 full.md 不保留可靠的逐页边界，因此此选项不可用。"
+          : "开启后在每页 OCR Markdown 之间插入 ---。",
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(Boolean(settings.ocrOnlyPaginate))
+          .setDisabled(usingMinerU)
+          .onChange((value) => this.updateSetting("ocrOnlyPaginate", value)),
+      );
+
+    if (usingMinerU) {
+      new Setting(containerEl)
+        .setName("远程任务清理")
+        .setDesc("MinerU 当前没有公开的任务删除接口，插件无法主动删除远程任务。");
+    } else {
+      new Setting(containerEl)
+        .setName("删除 Mistral 远程临时文件")
+        .setDesc("建议开启；每块 OCR 完成后立即尝试删除上传的临时 PDF。")
+        .addToggle((toggle) =>
+          toggle
+            .setValue(Boolean(settings.ocrOnlyDeleteMistralFile))
+            .onChange((value) => this.updateSetting("ocrOnlyDeleteMistralFile", value)),
+        );
+    }
+  }
+
+  renderMarkdownTranslationSettings(containerEl) {
+    const settings = this.plugin.settings;
+    containerEl.createEl("h4", { text: "输出设置" });
+    new Setting(containerEl)
+      .setName("输出文件名后缀")
+      .setDesc("例如：note.md 的译文保存为 note_翻译.md。")
+      .addText((text) =>
+        text
+          .setPlaceholder(DEFAULT_SETTINGS.markdownOutputSuffix)
+          .setValue(settings.markdownOutputSuffix)
+          .onChange((value) => this.updateSetting("markdownOutputSuffix", value)),
+      );
+
+    containerEl.createEl("h4", { text: "DeepSeek 设置" });
+    new Setting(containerEl)
+      .setName("API 地址")
+      .setDesc("仅用于直接翻译 Markdown；填写基础地址或完整的 /chat/completions 地址。")
+      .addText((text) =>
+        text
+          .setPlaceholder(DEFAULT_SETTINGS.markdownBaseUrl)
+          .setValue(settings.markdownBaseUrl)
+          .onChange((value) => this.updateSetting("markdownBaseUrl", value.trim())),
+      );
+
+    new Setting(containerEl)
+      .setName("模型")
+      .setDesc("DeepSeek 模型名称，也可以填写兼容服务的模型名。")
+      .addText((text) =>
+        text
+          .setPlaceholder(DEFAULT_SETTINGS.markdownModel)
+          .setValue(settings.markdownModel)
+          .onChange((value) => this.updateSetting("markdownModel", value.trim())),
+      );
+
+    new Setting(containerEl)
+      .setName("深度思考")
+      .setDesc("关闭通常更适合普通翻译；开启后可选择思考强度。")
+      .addToggle((toggle) =>
+        toggle.setValue(Boolean(settings.markdownThinkingEnabled)).onChange(async (value) => {
+          await this.updateSetting("markdownThinkingEnabled", value);
+          this.display();
+        }),
+      );
+
+    if (settings.markdownThinkingEnabled) {
+      new Setting(containerEl)
+        .setName("思考强度")
+        .setDesc("仅在深度思考开启时生效。")
+        .addDropdown((dropdown) =>
+          dropdown
+            .addOption("high", "High")
+            .addOption("max", "Max")
+            .setValue(settings.markdownReasoningEffort)
+            .onChange((value) => this.updateSetting("markdownReasoningEffort", value)),
+        );
+    }
+
+    new Setting(containerEl)
+      .setName("Temperature")
+      .setDesc(
+        settings.markdownThinkingEnabled
+          ? "深度思考模式下不发送 Temperature。"
+          : "控制随机性，范围 0–2；翻译建议使用较低值。",
+      )
+      .addText((text) => {
+        text
+          .setValue(String(settings.markdownTemperature))
+          .onChange((value) =>
+            this.updateFiniteNumber("markdownTemperature", value, 0, 2),
+          );
+        text.inputEl.type = "number";
+        text.inputEl.min = "0";
+        text.inputEl.max = "2";
+        text.inputEl.step = "0.1";
+      });
+
+    new Setting(containerEl)
+      .setName("最大输出 Token")
+      .setDesc("直接翻译 Markdown 时整篇发送，并使用此输出上限。")
+      .addText((text) => {
+        text
+          .setValue(String(settings.markdownMaxTokens))
+          .onChange((value) => this.updatePositiveInteger("markdownMaxTokens", value));
+        text.inputEl.type = "number";
+        text.inputEl.min = "1";
+      });
+
+    containerEl.createEl("h4", { text: "翻译提示词" });
+    this.renderPromptSetting(
+      containerEl,
+      "markdownTranslationPrompt",
+      DEFAULT_SETTINGS.markdownTranslationPrompt,
+    );
+  }
+
+  renderPromptSetting(containerEl, key, placeholder) {
+    new Setting(containerEl)
+      .setName("系统提示词")
+      .setDesc("Markdown 原文会作为下一条用户消息完整提交。")
+      .addTextArea((text) => {
+        text
+          .setPlaceholder(placeholder)
+          .setValue(this.plugin.settings[key])
+          .onChange((value) => this.updateSetting(key, value));
+        text.inputEl.rows = 14;
+        text.inputEl.addClass("deepseek-translator-prompt");
+      });
+  }
+
+  createCollapsibleSection(parent, id, title, description) {
+    const details = parent.createEl("details", {
+      cls: "pdf-translate-settings-section",
+      attr: { "data-section-id": id },
+    });
+    details.open = this.openSections.has(id);
+    const summary = details.createEl("summary");
+    summary.createEl("h3", { text: title });
+    summary.createEl("span", { text: description });
+    return details.createDiv({ cls: "pdf-translate-settings-section-content" });
+  }
+
+  captureOpenSections() {
+    const sections = this.containerEl?.querySelectorAll?.(
+      "details.pdf-translate-settings-section[data-section-id]",
+    );
+    if (!sections) {
+      return;
+    }
+    this.openSections.clear();
+    for (const section of sections) {
+      if (section.open) {
+        this.openSections.add(section.dataset.sectionId);
+      }
     }
   }
 

@@ -12,14 +12,14 @@ using System.Windows.Forms;
 [assembly: System.Reflection.AssemblyDescription("Installer for the Pdf translate to markdown Obsidian plugin")]
 [assembly: System.Reflection.AssemblyCompany("zhao0511")]
 [assembly: System.Reflection.AssemblyProduct("Pdf translate to markdown")]
-[assembly: System.Reflection.AssemblyVersion("0.7.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("0.7.0.0")]
+[assembly: System.Reflection.AssemblyVersion("0.8.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("0.8.0.0")]
 
 namespace PdfTranslateToMarkdownSetup
 {
     internal static class InstallerConstants
     {
-        internal const string PluginId = "deepseek-translator";
+        internal const string PluginId = "pdf-translate-to-markdown";
         internal const string Repository = "zhao0511/pdf-translate-to-markdown";
         internal const string LatestDownloadBase =
             "https://github.com/" + Repository + "/releases/latest/download/";
@@ -182,7 +182,7 @@ namespace PdfTranslateToMarkdownSetup
             using (var client = new WebClient())
             {
                 client.Headers[HttpRequestHeader.UserAgent] =
-                    "PdfTranslateToMarkdown-Setup/0.7.0";
+                    "PdfTranslateToMarkdown-Setup/0.8.0";
                 client.Headers[HttpRequestHeader.Accept] = "application/octet-stream";
                 return await client.DownloadDataTaskAsync(uri);
             }
@@ -626,7 +626,7 @@ namespace PdfTranslateToMarkdownSetup
                 }
 
                 byte[] manifest = Encoding.UTF8.GetBytes(
-                    "{\"id\":\"deepseek-translator\",\"version\":\"9.9.9\"}");
+                    "{\"id\":\"pdf-translate-to-markdown\",\"version\":\"9.9.9\"}");
                 if (InstallerLogic.ValidateManifest(manifest) != "9.9.9")
                 {
                     throw new Exception("Manifest validation failed.");
