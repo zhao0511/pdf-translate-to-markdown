@@ -101,6 +101,7 @@ const PluginClass = exported.default || exported;
 const files = new Map();
 const createdText = new Map();
 const createdBinary = [];
+const binaryDiskPaths = new Set();
 const pdf = new TFile("docs/paper.pdf");
 files.set(pdf.path, pdf);
 const opened = [];
@@ -109,6 +110,17 @@ const vault = {
   adapter: {
     async write(path, contents) {
       debugWrites.set(path, contents);
+    },
+    async writeBinary(path, contents) {
+      assert.equal(binaryDiskPaths.has(path), false, `unexpected binary overwrite: ${path}`);
+      binaryDiskPaths.add(path);
+      createdBinary.push({ path, size: contents.byteLength });
+    },
+    async exists(path) {
+      return files.has(path) || binaryDiskPaths.has(path);
+    },
+    async remove(path) {
+      binaryDiskPaths.delete(path);
     },
   },
   getAbstractFileByPath(path) {
@@ -230,7 +242,10 @@ plugin.createMistralService = () => ({
         {
           index: 0,
           markdown: "\\[\nx=1\n\\]\n\n![figure](img-0.jpeg)",
-          images: [{ id: "img-0.jpeg", imageBase64: "data:image/jpeg;base64,AA==" }],
+          images: [
+            { id: "img-0.jpeg", imageBase64: "data:image/jpeg;base64,AA==" },
+            { id: "unused.jpeg", imageBase64: "data:image/jpeg;base64,Ag==" },
+          ],
         },
         {
           index: 1,
@@ -252,6 +267,7 @@ plugin.createMistralService = () => ({
   assert.equal(defaultPlugin.settings.maxTokens, 100000);
   assert.equal(defaultPlugin.settings.outputSuffix, "_翻译");
   assert.equal(defaultPlugin.settings.keepOcrMarkdown, false);
+  assert.equal(defaultPlugin.settings.numberSplitOutputFiles, true);
   assert.equal(defaultPlugin.settings.paginate, true);
   assert.equal(defaultPlugin.settings.ocrOnlyProvider, "mistral");
   assert.equal(defaultPlugin.settings.ocrOnlyOutputSuffix, "_OCR");
@@ -269,6 +285,131 @@ plugin.createMistralService = () => ({
     crypto.createHash("sha256").update(defaultPlugin.settings.translationPrompt).digest("hex"),
     "335276be2e6e9d32738a2a41ddfa44de188c5e895dc40ee7ae18569861c82251",
   );
+
+  let activeLimitedOperations = 0;
+  let maxLimitedOperations = 0;
+  const limitedResults = await plugin.settleWithConcurrency(
+    [1, 2, 3, 4, 5],
+    2,
+    async (value) => {
+      activeLimitedOperations += 1;
+      maxLimitedOperations = Math.max(maxLimitedOperations, activeLimitedOperations);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      activeLimitedOperations -= 1;
+      return value * 2;
+    },
+  );
+  assert.equal(maxLimitedOperations, 2);
+  assert.deepEqual(limitedResults.map((result) => result.value), [2, 4, 6, 8, 10]);
+
+  let activeMaterializations = 0;
+  let maxActiveMaterializations = 0;
+  await Promise.all([1, 2, 3].map(() =>
+    plugin.runExclusiveOcrMaterialization(async () => {
+      activeMaterializations += 1;
+      maxActiveMaterializations = Math.max(maxActiveMaterializations, activeMaterializations);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      activeMaterializations -= 1;
+    }),
+  ));
+  assert.equal(maxActiveMaterializations, 1);
+
+  const priorityOrder = [];
+  let releasePriorityBlocker;
+  let signalPriorityBlocker;
+  const priorityBlockerStarted = new Promise((resolve) => { signalPriorityBlocker = resolve; });
+  const priorityBlocker = plugin.runExclusiveOcrMaterialization(async () => {
+    priorityOrder.push("blocker");
+    signalPriorityBlocker();
+    await new Promise((resolve) => { releasePriorityBlocker = resolve; });
+  });
+  await priorityBlockerStarted;
+  const lowPriority = plugin.runExclusiveOcrMaterialization(
+    async () => priorityOrder.push("10 pages"),
+    10,
+  );
+  const highPriority = plugin.runExclusiveOcrMaterialization(
+    async () => priorityOrder.push("100 pages"),
+    100,
+  );
+  const mediumPriority = plugin.runExclusiveOcrMaterialization(
+    async () => priorityOrder.push("50 pages"),
+    50,
+  );
+  releasePriorityBlocker();
+  await Promise.all([priorityBlocker, lowPriority, highPriority, mediumPriority]);
+  assert.deepEqual(priorityOrder, ["blocker", "100 pages", "50 pages", "10 pages"]);
+
+  const parallelPlugin = new PluginClass(app);
+  parallelPlugin.settings = { ...plugin.settings, extractImages: false };
+  let activeRemoteOcr = 0;
+  let maxActiveRemoteOcr = 0;
+  let startedRemoteOcr = 0;
+  let releaseRemoteOcr;
+  let signalAllRemoteOcrStarted;
+  const remoteOcrGate = new Promise((resolve) => { releaseRemoteOcr = resolve; });
+  const allRemoteOcrStarted = new Promise((resolve) => { signalAllRemoteOcrStarted = resolve; });
+  const parallelStates = Array.from({ length: 6 }, (_, index) => ({
+    index,
+    segment: { start: index + 1, end: index + 1, arrayBuffer: null },
+    segmentName: `parallel-${index + 1}.pdf`,
+    ocrProvider: "mistral",
+    ocrSettings: {
+      ...parallelPlugin.settings,
+      extractImages: false,
+      keepOcrMarkdown: false,
+      deleteMistralFile: false,
+    },
+    ocrService: {
+      supportsRemoteDelete: false,
+      async processOcr() {
+        activeRemoteOcr += 1;
+        startedRemoteOcr += 1;
+        maxActiveRemoteOcr = Math.max(maxActiveRemoteOcr, activeRemoteOcr);
+        if (startedRemoteOcr === 6) {
+          signalAllRemoteOcrStarted();
+        }
+        await remoteOcrGate;
+        activeRemoteOcr -= 1;
+        return { pages: [{ index: 0, markdown: `parallel ${index + 1}`, images: [] }] };
+      },
+    },
+    uploaded: true,
+    remoteFileId: `parallel-${index + 1}`,
+    remoteDeleted: false,
+    remoteFileIds: new Set(),
+    deletedRemoteFileIds: new Set(),
+    signedUrl: `https://mistral.test/parallel-${index + 1}`,
+    ocrResponse: null,
+    ocrMarkdown: null,
+    ocrDone: false,
+    imageLinks: new Map(),
+    createdImagePaths: new Set(),
+    translated: null,
+    translationDone: false,
+    failure: null,
+  }));
+  const parallelAttempt = parallelPlugin.processPdfAttempt({
+    states: parallelStates,
+    file: pdf,
+    outputPlan: {
+      ocrPath: "docs/parallel.md",
+      translationPath: "docs/parallel_翻译.md",
+      attachmentReferencePath: "docs/parallel_翻译.md",
+    },
+    pdfHash: "parallel-hash",
+    updateProgress() {},
+    debugSession: null,
+    includeTranslation: false,
+  });
+  await Promise.race([
+    allRemoteOcrStarted,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("remote OCR did not fan out")), 1000)),
+  ]);
+  assert.equal(maxActiveRemoteOcr, 6, "remote OCR calls should not be capped by local processing limits");
+  releaseRemoteOcr();
+  assert.equal((await parallelAttempt).length, 0);
+  assert.equal(parallelStates.every((state) => state.ocrDone), true);
 
   await plugin.translatePdf(pdf);
 
@@ -380,6 +521,52 @@ plugin.createMistralService = () => ({
   assert.equal(firstPartIndex >= 0, true);
   assert.equal(secondPartIndex > firstPartIndex, true);
 
+  const splitOutputPdf = new TFile("docs/split-output.pdf");
+  files.set(splitOutputPdf.path, splitOutputPdf);
+  const splitOutputPlugin = new PluginClass(app);
+  splitOutputPlugin.settings = {
+    ...largePlugin.settings,
+    keepOcrMarkdown: true,
+  };
+  splitOutputPlugin.busyFiles = new Set();
+  splitOutputPlugin.activeProgress = new Set();
+  splitOutputPlugin.createPdfDocumentService = largePlugin.createPdfDocumentService;
+  splitOutputPlugin.choosePdfRanges = async () => ({
+    mergeOutput: false,
+    ranges: [
+      { start: 1, end: 60, blockName: "第一章" },
+      { start: 61, end: 120, blockName: "第二章" },
+    ],
+  });
+  splitOutputPlugin.createMistralService = largePlugin.createMistralService;
+
+  await splitOutputPlugin.translatePdf(splitOutputPdf);
+  assert.equal(files.get("docs/split-output_翻译") instanceof TFolder, true);
+  assert.equal(createdText.has("docs/split-output_翻译.md"), false);
+  assert.equal(createdText.has("docs/split-output_翻译/1 第一章.md"), true);
+  assert.equal(createdText.has("docs/split-output_翻译/2 第二章.md"), true);
+  assert.equal(opened.at(-1), "docs/split-output_翻译/1 第一章.md");
+
+  const splitNoNumberPdf = new TFile("docs/split-no-number.pdf");
+  files.set(splitNoNumberPdf.path, splitNoNumberPdf);
+  const splitNoNumberPlugin = new PluginClass(app);
+  splitNoNumberPlugin.settings = {
+    ...splitOutputPlugin.settings,
+    numberSplitOutputFiles: false,
+  };
+  splitNoNumberPlugin.busyFiles = new Set();
+  splitNoNumberPlugin.activeProgress = new Set();
+  splitNoNumberPlugin.createPdfDocumentService = largePlugin.createPdfDocumentService;
+  splitNoNumberPlugin.choosePdfRanges = splitOutputPlugin.choosePdfRanges;
+  splitNoNumberPlugin.createMistralService = largePlugin.createMistralService;
+
+  await splitNoNumberPlugin.translatePdf(splitNoNumberPdf);
+  assert.equal(files.get("docs/split-no-number_翻译") instanceof TFolder, true);
+  assert.equal(createdText.has("docs/split-no-number_翻译/第一章.md"), true);
+  assert.equal(createdText.has("docs/split-no-number_翻译/第二章.md"), true);
+  assert.equal(createdText.has("docs/split-no-number_翻译/1 第一章.md"), false);
+  assert.equal(opened.at(-1), "docs/split-no-number_翻译/第一章.md");
+
   const barrierPdf = new TFile("docs/barrier.pdf");
   files.set(barrierPdf.path, barrierPdf);
   const barrierPlugin = new PluginClass(app);
@@ -438,8 +625,8 @@ plugin.createMistralService = () => ({
     barrierPrompts += 1;
     assert.equal(
       barrierTranslationCalls,
-      0,
-      "no translation may start when any OCR segment has failed",
+      1,
+      "a successful segment should translate without waiting for another segment's OCR failure",
     );
     return "retry";
   };
@@ -586,7 +773,7 @@ plugin.createMistralService = () => ({
   await abandonPlugin.translatePdf(abandonPdf);
   const abandonedImage = createdBinary.find(({ path }) => path.includes("abandon--"));
   assert.ok(abandonedImage, "the OCR image should have been created before translation");
-  assert.equal(files.has(abandonedImage.path), false, "abandon should delete OCR images");
+  assert.equal(binaryDiskPaths.has(abandonedImage.path), false, "abandon should delete OCR images");
   assert.equal(abandonRemoteDeletes, 1, "abandon should delete the remote PDF");
   assert.equal(createdText.has("docs/abandon_翻译.md"), false);
 

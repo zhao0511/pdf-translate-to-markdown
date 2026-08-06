@@ -88,6 +88,40 @@ export function countSelectedPages(ranges) {
   return ranges.reduce((total, { start, end }) => total + end - start + 1, 0);
 }
 
+export function createDefaultPdfBlockName(range, index = 0) {
+  const title = String(range?.title || "").trim();
+  const fallback = Number.isInteger(range?.start) && Number.isInteger(range?.end)
+    ? `第 ${range.start}-${range.end} 页`
+    : `分块 ${index + 1}`;
+  const candidate = title || fallback;
+  return candidate
+    .replace(/[\\/:*?"<>|]/g, "-")
+    .replace(/[.\s]+$/g, "")
+    .trim() || fallback;
+}
+
+export function validatePdfBlockNames(ranges) {
+  const seen = new Set();
+  return (ranges || []).map((range, index) => {
+    const name = String(range?.blockName || "").trim();
+    if (!name) {
+      throw new Error(`第 ${index + 1} 块的块名不能为空`);
+    }
+    if (name.length > 120) {
+      throw new Error(`第 ${index + 1} 块的块名不能超过 120 个字符`);
+    }
+    if (/[\\/:*?"<>|]/.test(name) || /[.\s]$/.test(name) || name === "." || name === "..") {
+      throw new Error(`第 ${index + 1} 块的块名含有不能用于文件名的字符`);
+    }
+    const key = name.normalize("NFKC").toLocaleLowerCase();
+    if (seen.has(key)) {
+      throw new Error(`块名不能重复：${name}`);
+    }
+    seen.add(key);
+    return name;
+  });
+}
+
 export function findPdfRangeGaps(ranges, pageCount) {
   if (!Number.isInteger(pageCount) || pageCount < 1) {
     return [];

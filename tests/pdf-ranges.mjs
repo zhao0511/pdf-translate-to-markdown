@@ -4,12 +4,14 @@ import { PDFDocument } from "pdf-lib";
 import { PdfDocumentService } from "../src/pdf-document-service.mjs";
 import {
   countSelectedPages,
+  createDefaultPdfBlockName,
   createNextPdfRangeDraft,
   createDefaultPdfRanges,
   findPdfRangeGaps,
   mergeMarkdownParts,
   parsePdfRangeRules,
   shouldAutoFillPdfRangeEnd,
+  validatePdfBlockNames,
   validatePdfRanges,
 } from "../src/pdf-range-utils.mjs";
 
@@ -26,6 +28,20 @@ assert.deepEqual(normalized, [
   { start: 101, end: 150 },
 ]);
 assert.equal(countSelectedPages(normalized), 101);
+assert.equal(
+  createDefaultPdfBlockName({ start: 10, end: 20, title: "Chapter 1: Intro" }),
+  "Chapter 1- Intro",
+);
+assert.equal(createDefaultPdfBlockName({ start: 10, end: 20 }), "第 10-20 页");
+assert.deepEqual(
+  validatePdfBlockNames([{ blockName: "前言" }, { blockName: "第一章" }]),
+  ["前言", "第一章"],
+);
+assert.throws(
+  () => validatePdfBlockNames([{ blockName: "第一章" }, { blockName: "第一章" }]),
+  /不能重复/,
+);
+assert.throws(() => validatePdfBlockNames([{ blockName: "第一/章" }]), /不能用于文件名/);
 assert.deepEqual(findPdfRangeGaps([{ start: 1, end: 9 }, { start: 12, end: 20 }], 25), [
   { start: 10, end: 11 },
   { start: 21, end: 25 },

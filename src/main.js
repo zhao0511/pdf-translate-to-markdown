@@ -18,8 +18,9 @@ import {
 } from "./defaults.js";
 import {
   imageExtension,
+  markdownImageBasenames,
   normalizeMistralMath,
-  replaceMistralImagePlaceholder,
+  replaceMistralImagePlaceholders,
   sanitizePathSegment,
   shortContentHash,
   stripDataUrlPrefix,
@@ -39,6 +40,7 @@ import {
   countSelectedPages,
   createDefaultPdfRanges,
   mergeMarkdownParts,
+  validatePdfBlockNames,
 } from "./pdf-range-utils.mjs";
 import { TaskProgress } from "./task-progress.js";
 import { TaskFailureModal } from "./task-failure-modal.js";
@@ -47,6 +49,7 @@ import { GithubReleaseService, isVersionNewer } from "./update-service.mjs";
 const MAX_STAGE_ATTEMPTS = 3;
 const MAX_RATE_LIMIT_ATTEMPTS = 6;
 const DEFAULT_RATE_LIMIT_WAIT_MS = 60000;
+const DEBUG_WRITE_DEBOUNCE_MS = 750;
 
 class DeepSeekTranslatorPlugin extends Plugin {
   async onload() {
@@ -262,27 +265,42 @@ class DeepSeekTranslatorPlugin extends Plugin {
       });
 
       let ranges = [{ start: 1, end: pageCount }];
+      let mergeOutput = true;
       if (pageCount > PDF_SPLIT_THRESHOLD) {
         progress.setPhase(3, "等待选择翻译页码");
-        ranges = await this.choosePdfRanges(file, pageCount, {
+        const rangeSelection = await this.choosePdfRanges(file, pageCount, {
           pdfDocument,
           pdfBytes,
           debugSession,
         });
-        if (!ranges) {
+        if (!rangeSelection) {
           await this.finishDebugSession(debugSession, "cancelled");
           new Notice("已取消 PDF 翻译。", 4000);
           return;
         }
+        if (Array.isArray(rangeSelection)) {
+          ranges = rangeSelection;
+        } else {
+          ranges = rangeSelection.ranges;
+          mergeOutput = rangeSelection.mergeOutput !== false;
+        }
       }
 
-      const outputPlan = this.getAvailablePdfOutputPlan(file);
+      const blockNames = mergeOutput ? [] : validatePdfBlockNames(ranges);
+
+      const outputPlan = this.getAvailablePdfOutputPlan(file, {
+        mergeOutput,
+        firstBlockName: blockNames[0] || "分块 1",
+      });
       await this.ensureOutputFolder(outputPlan.outputFolder);
 
       progress.setPhase(2, ranges.length > 1 ? `准备 ${ranges.length} 个 PDF 分段` : "准备 PDF");
       const segments = await pdfDocument.createSegments(ranges);
+      const sharedOcrService = this.settings.ocrProvider === "mineru"
+        ? this.createOcrService(this.settings)
+        : null;
       const states = segments.map((segment, index) =>
-        this.createPdfSegmentState(segment, index, file),
+        this.createPdfSegmentState(segment, index, file, this.settings, sharedOcrService),
       );
       await this.initializeDebugSegments(debugSession, states, ranges);
       const updateAggregateProgress = (retryLabel = "") => {
@@ -352,7 +370,7 @@ class DeepSeekTranslatorPlugin extends Plugin {
         savedImageCount: state.imageLinks.size,
       }));
 
-      progress.setPhase(4, "合并分块结果");
+      progress.setPhase(4, mergeOutput ? "合并分块结果" : "整理分块结果");
       const ocrSeparator =
         this.settings.ocrProvider !== "mineru" && this.settings.paginate
           ? "\n\n---\n\n"
@@ -361,7 +379,9 @@ class DeepSeekTranslatorPlugin extends Plugin {
         results.map((result) => result.ocrMarkdown),
         ocrSeparator,
       );
-      const translated = mergeMarkdownParts(results.map((result) => result.translated));
+      const translated = mergeOutput
+        ? mergeMarkdownParts(results.map((result) => result.translated))
+        : null;
 
       progress.setPhase(5, "保存 OCR Markdown");
       let ocrFile = null;
@@ -372,13 +392,35 @@ class DeepSeekTranslatorPlugin extends Plugin {
       }
 
       progress.setPhase(6, "保存译文");
-      const translatedFile = await this.app.vault.create(outputPlan.translationPath, translated);
+      const translatedFiles = [];
+      if (mergeOutput) {
+        translatedFiles.push(
+          await this.app.vault.create(outputPlan.translationPath, translated),
+        );
+      } else {
+        await this.ensureOutputFolder(outputPlan.translationFolder);
+        for (let index = 0; index < results.length; index += 1) {
+          const blockStem = sanitizePathSegment(blockNames[index], `分块 ${index + 1}`);
+          const blockFileName = this.settings.numberSplitOutputFiles === false
+            ? `${blockStem}.md`
+            : `${index + 1} ${blockStem}.md`;
+          const blockPath = this.joinPath(
+            outputPlan.translationFolder,
+            blockFileName,
+          );
+          translatedFiles.push(
+            await this.app.vault.create(blockPath, results[index].translated),
+          );
+        }
+      }
       progress.setPhase(7, "完成输出");
       await this.movePdfIfRequested(file, outputPlan);
-      await this.openFileSafely(translatedFile);
+      await this.openFileSafely(translatedFiles[0]);
       await this.updateDebugSession(debugSession, "output-saved", {
         ocrPath: ocrFile?.path || null,
-        translationPath: translatedFile.path,
+        translationPath: mergeOutput ? translatedFiles[0].path : null,
+        translationFolder: mergeOutput ? null : outputPlan.translationFolder,
+        translationPaths: translatedFiles.map((translatedFile) => translatedFile.path),
       });
 
       const selectedPages = countSelectedPages(ranges);
@@ -392,7 +434,10 @@ class DeepSeekTranslatorPlugin extends Plugin {
         `${savedImageCount} 张图片`,
         ocrFile ? `OCR：${ocrFile.path}` : "未保留 OCR 文件",
       ].join("；");
-      progress.complete(`PDF 翻译完成：${translatedFile.path}（${details}）`);
+      const translationDestination = mergeOutput
+        ? translatedFiles[0].path
+        : outputPlan.translationFolder;
+      progress.complete(`PDF 翻译完成：${translationDestination}（${details}）`);
       await this.finishDebugSession(debugSession, "completed");
     } catch (error) {
       console.error("Pdf translate to markdown PDF pipeline:", error);
@@ -442,8 +487,11 @@ class DeepSeekTranslatorPlugin extends Plugin {
       const outputPlan = this.getAvailableOcrOnlyOutputPlan(file, ocrSettings);
       await this.ensureOutputFolder(outputPlan.outputFolder);
       const segments = await pdfDocument.createSegments(ranges);
+      const sharedOcrService = ocrSettings.ocrProvider === "mineru"
+        ? this.createOcrService(ocrSettings)
+        : null;
       const states = segments.map((segment, index) =>
-        this.createPdfSegmentState(segment, index, file, ocrSettings),
+        this.createPdfSegmentState(segment, index, file, ocrSettings, sharedOcrService),
       );
       await this.initializeDebugSegments(debugSession, states, ranges);
 
@@ -1031,7 +1079,13 @@ class DeepSeekTranslatorPlugin extends Plugin {
 {"status":"need_more","reason":"说明还缺少什么证据","pageMapping":null,"chapters":[],"backMatter":null,"warnings":[]}`;
   }
 
-  createPdfSegmentState(segment, index, file, ocrSettings = this.settings) {
+  createPdfSegmentState(
+    segment,
+    index,
+    file,
+    ocrSettings = this.settings,
+    ocrService = null,
+  ) {
     const segmentName = segment.isWholeDocument
       ? file.name
       : `${sanitizePathSegment(file.basename, "PDF")}--p${String(segment.start).padStart(
@@ -1044,7 +1098,7 @@ class DeepSeekTranslatorPlugin extends Plugin {
       segmentName,
       ocrProvider: ocrSettings.ocrProvider === "mineru" ? "mineru" : "mistral",
       ocrSettings,
-      ocrService: this.createOcrService(ocrSettings),
+      ocrService: ocrService || this.createOcrService(ocrSettings),
       uploaded: false,
       remoteFileId: null,
       remoteDeleted: false,
@@ -1071,57 +1125,132 @@ class DeepSeekTranslatorPlugin extends Plugin {
     debugSession,
     includeTranslation = true,
   }) {
-    const stages = [
-      {
-        pending: (state) => !state.uploaded,
-        run: (state) => this.uploadPdfSegment(state, updateProgress, debugSession),
-      },
-      {
-        pending: (state) => !state.ocrDone,
-        run: (state) =>
-          this.ocrPdfSegment(
+    const pendingUploads = states.filter((state) => !state.uploaded);
+    if (pendingUploads.length > 0) {
+      await this.prepareMineruBatchUploads(pendingUploads, updateProgress);
+    }
+
+    const settled = await Promise.allSettled(states.map(async (state) => {
+      try {
+        if (!state.uploaded) {
+          await this.uploadPdfSegment(state, updateProgress, debugSession);
+        }
+        if (!state.ocrDone) {
+          await this.ocrPdfSegment(
             state,
             file,
             outputPlan,
             pdfHash,
             updateProgress,
             debugSession,
-          ),
-      },
-    ];
-    if (includeTranslation) {
-      stages.push({
-        pending: (state) => !state.translationDone,
-        run: (state) => this.translatePdfSegment(state, updateProgress, debugSession),
-      });
-    }
+          );
+        }
+        if (includeTranslation && !state.translationDone) {
+          await this.translatePdfSegment(state, updateProgress, debugSession);
+        }
+        state.failure = null;
+      } catch (error) {
+        state.failure = error;
+        throw error;
+      } finally {
+        updateProgress();
+      }
+    }));
 
-    for (const stage of stages) {
-      const pendingStates = states.filter(stage.pending);
-      if (pendingStates.length === 0) {
-        continue;
+    return settled
+      .map((result, index) => ({ result, state: states[index] }))
+      .filter(({ result }) => result.status === "rejected");
+  }
+
+  async settleWithConcurrency(items, limit, operation) {
+    const results = new Array(items.length);
+    let nextIndex = 0;
+    const workerCount = Math.max(1, Math.min(items.length, Math.floor(limit) || 1));
+    const workers = Array.from({ length: workerCount }, async () => {
+      while (nextIndex < items.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        try {
+          results[index] = { status: "fulfilled", value: await operation(items[index], index) };
+        } catch (reason) {
+          results[index] = { status: "rejected", reason };
+        }
       }
-      const settled = await Promise.allSettled(
-        pendingStates.map(async (state) => {
-          try {
-            await stage.run(state);
-            state.failure = null;
-          } catch (error) {
-            state.failure = error;
-            throw error;
-          } finally {
-            updateProgress();
-          }
-        }),
-      );
-      const failures = settled
-        .map((result, index) => ({ result, state: pendingStates[index] }))
-        .filter(({ result }) => result.status === "rejected");
-      if (failures.length > 0) {
-        return failures;
-      }
+    });
+    await Promise.all(workers);
+    return results;
+  }
+
+  runExclusiveOcrMaterialization(operation, priority = 0) {
+    if (!this.ocrMaterializePriorityQueue) {
+      this.ocrMaterializePriorityQueue = [];
+      this.ocrMaterializeSequence = 0;
+      this.ocrMaterializeActive = false;
     }
-    return [];
+    return new Promise((resolve, reject) => {
+      this.ocrMaterializePriorityQueue.push({
+        operation,
+        priority: Number.isFinite(priority) ? priority : 0,
+        sequence: this.ocrMaterializeSequence,
+        resolve,
+        reject,
+      });
+      this.ocrMaterializeSequence += 1;
+      this.ocrMaterializePriorityQueue.sort(
+        (left, right) => right.priority - left.priority || left.sequence - right.sequence,
+      );
+      this.scheduleOcrMaterializeDrain();
+    });
+  }
+
+  scheduleOcrMaterializeDrain() {
+    if (this.ocrMaterializeDrainScheduled || this.ocrMaterializeActive) {
+      return;
+    }
+    this.ocrMaterializeDrainScheduled = true;
+    globalThis.setTimeout(() => {
+      this.ocrMaterializeDrainScheduled = false;
+      this.drainOcrMaterializeQueue();
+    }, 0);
+  }
+
+  drainOcrMaterializeQueue() {
+    if (this.ocrMaterializeActive || !this.ocrMaterializePriorityQueue?.length) {
+      return;
+    }
+    const entry = this.ocrMaterializePriorityQueue.shift();
+    this.ocrMaterializeActive = true;
+    Promise.resolve()
+      .then(entry.operation)
+      .then(entry.resolve, entry.reject)
+      .finally(() => {
+        this.ocrMaterializeActive = false;
+        this.scheduleOcrMaterializeDrain();
+      });
+  }
+
+  async prepareMineruBatchUploads(states, updateProgress) {
+    const mineruStates = states.filter(
+      (state) => state.ocrProvider === "mineru" &&
+        typeof state.ocrService.prepareBatchUploads === "function",
+    );
+    if (mineruStates.length < 2) {
+      return;
+    }
+    const service = mineruStates[0].ocrService;
+    const sharedStates = mineruStates.filter((state) => state.ocrService === service);
+    if (sharedStates.length < 2) {
+      return;
+    }
+    try {
+      await this.runStageWithRetries(
+        "准备 MinerU 批量上传",
+        () => service.prepareBatchUploads(sharedStates.map((state) => state.segmentName)),
+        updateProgress,
+      );
+    } catch (error) {
+      console.warn("Unable to prepare MinerU batch upload; falling back to individual batches:", error);
+    }
   }
 
   async uploadPdfSegment(state, updateProgress, debugSession) {
@@ -1167,6 +1296,7 @@ class DeepSeekTranslatorPlugin extends Plugin {
     state.remoteFileIds.add(uploaded.fileId);
     state.signedUrl = uploaded.url;
     state.uploaded = true;
+    state.segment.arrayBuffer = null;
     await this.updateDebugSegment(debugSession, state, {
       uploaded: true,
       remoteFileId: uploaded.fileId,
@@ -1187,9 +1317,13 @@ class DeepSeekTranslatorPlugin extends Plugin {
         "OCR",
         async (attempt) => {
           if (attempt > 1 || !state.signedUrl) {
-            state.signedUrl = await state.ocrService.getSignedUrl(state.remoteFileId);
+            state.signedUrl = await state.ocrService.getSignedUrl(
+              state.remoteFileId,
+              state.signedUrl,
+            );
           }
           const response = await state.ocrService.processOcr(state.signedUrl, {
+            deferLocalProcessing: true,
             onProgress: (status) => {
               const count =
                 status.extractedPages !== null && status.totalPages !== null
@@ -1203,7 +1337,9 @@ class DeepSeekTranslatorPlugin extends Plugin {
             status: "received",
             response: debugResponse,
           });
-          this.validateOcrPageCount(response, state.segment, state.ocrProvider);
+          if (!response?.deferredLocalProcessing) {
+            this.validateOcrPageCount(response, state.segment, state.ocrProvider);
+          }
           return response;
         },
         updateProgress,
@@ -1217,25 +1353,47 @@ class DeepSeekTranslatorPlugin extends Plugin {
       );
     }
 
-    const materialized = await this.runStageWithRetries(
-      "OCR",
-      () =>
-        this.materializeOcrResult(
-          state.ocrResponse.pages,
-          file,
-          outputPlan,
-          pdfHash,
-          { update: () => updateProgress() },
-          {
-            pageNumberOffset: state.segment.start - 1,
-            settings: state.ocrSettings,
-            existingImageLinks: state.imageLinks,
-            onImageSaved: ({ key, path, embeddedLink }) => {
-              state.imageLinks.set(key, { path, embeddedLink });
-              state.createdImagePaths.add(path);
+    let finalizedOcrResponse = state.ocrResponse?.deferredLocalProcessing
+      ? null
+      : state.ocrResponse;
+    const localResult = await this.runStageWithRetries(
+      "OCR 结果处理",
+      (attempt) =>
+        this.runExclusiveOcrMaterialization(async () => {
+          if (!finalizedOcrResponse) {
+            finalizedOcrResponse = typeof state.ocrService.materializeOcrResponse === "function"
+              ? await state.ocrService.materializeOcrResponse(state.ocrResponse)
+              : state.ocrResponse;
+          }
+          this.validateOcrPageCount(
+            finalizedOcrResponse,
+            state.segment,
+            state.ocrProvider,
+          );
+          await this.recordDebugAttempt(debugSession, state, "ocr-result", attempt, {
+            status: "processed",
+            response: this.sanitizeOcrResponseForDebug(finalizedOcrResponse),
+          });
+          const materialized = await this.materializeOcrResult(
+            finalizedOcrResponse.pages,
+            file,
+            outputPlan,
+            pdfHash,
+            { update: () => updateProgress() },
+            {
+              pageNumberOffset: state.segment.start - 1,
+              settings: state.ocrSettings,
+              existingImageLinks: state.imageLinks,
+              onImageSaved: ({ key, path, embeddedLink, created }) => {
+                state.imageLinks.set(key, { path, embeddedLink });
+                if (created) {
+                  state.createdImagePaths.add(path);
+                }
+              },
             },
-          },
-        ),
+          );
+          return { materialized, response: finalizedOcrResponse };
+        }, state.segment.end - state.segment.start + 1),
       updateProgress,
       {
         onAttemptFailure: (attempt, error) =>
@@ -1245,6 +1403,8 @@ class DeepSeekTranslatorPlugin extends Plugin {
           }),
       },
     );
+    state.ocrResponse = localResult.response;
+    const materialized = localResult.materialized;
     const normalized = normalizeMistralMath(materialized.markdown);
     state.ocrMarkdown = normalized.markdown;
     state.ocrDone = true;
@@ -1257,6 +1417,8 @@ class DeepSeekTranslatorPlugin extends Plugin {
       ocrMathReplacementCount: normalized.replacementCount,
       imagePaths: [...state.createdImagePaths],
     });
+    state.ocrResponse = null;
+    state.signedUrl = null;
     updateProgress();
     if (state.ocrSettings.deleteMistralFile && state.ocrService.supportsRemoteDelete !== false) {
       await this.tryDeleteRemoteFile(state);
@@ -1588,6 +1750,16 @@ class DeepSeekTranslatorPlugin extends Plugin {
             () => this.app.vault.delete(file, true),
             () => {},
           );
+        } else if (typeof this.app.vault.adapter.remove === "function") {
+          const exists = typeof this.app.vault.adapter.exists !== "function" ||
+            await this.app.vault.adapter.exists(path);
+          if (exists) {
+            await this.runStageWithRetries(
+              "清理 OCR 图片",
+              () => this.app.vault.adapter.remove(path),
+              () => {},
+            );
+          }
         }
       }),
     );
@@ -1665,6 +1837,9 @@ class DeepSeekTranslatorPlugin extends Plugin {
       segments: [],
       events: [],
       writeQueue: Promise.resolve(),
+      writeDirty: false,
+      writeScheduled: false,
+      writeTimer: null,
     };
     void this.updateDebugSession(session, "task-started");
     return session;
@@ -1745,14 +1920,42 @@ class DeepSeekTranslatorPlugin extends Plugin {
       type: "task-finished",
       data: error ? { error: this.serializeError(error) } : { status },
     });
-    await this.queueDebugWrite(session);
+    await this.queueDebugWrite(session, { flush: true });
     await session.writeQueue;
   }
 
-  queueDebugWrite(session) {
+  queueDebugWrite(session, options = {}) {
     if (!session) {
       return Promise.resolve();
     }
+    session.writeDirty = true;
+    if (options.flush) {
+      return this.flushDebugWrite(session);
+    }
+    if (!session.writeScheduled) {
+      session.writeScheduled = true;
+      session.writeTimer = globalThis.setTimeout(() => {
+        session.writeScheduled = false;
+        session.writeTimer = null;
+        void this.flushDebugWrite(session);
+      }, DEBUG_WRITE_DEBOUNCE_MS);
+    }
+    return Promise.resolve();
+  }
+
+  flushDebugWrite(session) {
+    if (!session) {
+      return Promise.resolve();
+    }
+    if (session.writeTimer !== null) {
+      globalThis.clearTimeout(session.writeTimer);
+      session.writeTimer = null;
+      session.writeScheduled = false;
+    }
+    if (!session.writeDirty) {
+      return session.writeQueue;
+    }
+    session.writeDirty = false;
     const snapshot = JSON.stringify(
       {
         schemaVersion: session.schemaVersion,
@@ -1775,6 +1978,16 @@ class DeepSeekTranslatorPlugin extends Plugin {
       .then(() => this.app.vault.adapter.write(session.path, snapshot))
       .catch((error) => {
         console.warn("Unable to write debug snapshot:", error);
+      })
+      .finally(() => {
+        if (session.writeDirty && !session.writeScheduled) {
+          session.writeScheduled = true;
+          session.writeTimer = globalThis.setTimeout(() => {
+            session.writeScheduled = false;
+            session.writeTimer = null;
+            void this.flushDebugWrite(session);
+          }, DEBUG_WRITE_DEBOUNCE_MS);
+        }
       });
     return session.writeQueue;
   }
@@ -1790,22 +2003,14 @@ class DeepSeekTranslatorPlugin extends Plugin {
       pages: Array.isArray(response?.pages)
         ? response.pages.map((page) => ({
             index: page.index,
-            markdown: page.markdown || "",
-            images: (page.images || []).map((image) => ({
-              id: image.id || null,
-              topLeftX: image.topLeftX ?? null,
-              topLeftY: image.topLeftY ?? null,
-              bottomRightX: image.bottomRightX ?? null,
-              bottomRightY: image.bottomRightY ?? null,
-              pageIndex: image.pageIndex ?? null,
-              hasImageBase64: Boolean(image.imageBase64),
-            })),
+            markdownChars: String(page.markdown || "").length,
+            imageCount: Array.isArray(page.images) ? page.images.length : 0,
           }))
         : [],
       analysisPages: Array.isArray(response?.analysisPages)
         ? response.analysisPages.map((page) => ({
             index: page.index,
-            markdown: page.markdown || "",
+            markdownChars: String(page.markdown || "").length,
           }))
         : [],
     };
@@ -2016,30 +2221,64 @@ class DeepSeekTranslatorPlugin extends Plugin {
     }
   }
 
-  getAvailablePdfOutputPlan(pdfFile) {
+  getAvailablePdfOutputPlan(pdfFile, options = {}) {
     const parent = this.parentPath(pdfFile.path);
     const originalStem = sanitizePathSegment(pdfFile.basename, "PDF");
     const translationSuffix = this.sanitizeSuffix(this.settings.outputSuffix);
     const useSubfolder = this.settings.pdfOutputMode === "subfolder";
+    const mergeOutput = options.mergeOutput !== false;
 
     for (let index = 0; ; index += 1) {
       const stem = index === 0 ? originalStem : `${originalStem} ${index + 1}`;
       const outputFolder = useSubfolder ? this.joinPath(parent, stem) : parent;
       const ocrPath = this.joinPath(outputFolder, `${stem}.md`);
-      const translationPath = this.joinPath(outputFolder, `${stem}${translationSuffix}.md`);
+      const translationStem = `${stem}${translationSuffix}`;
+      const translationFolder = this.joinPath(outputFolder, translationStem);
+      const translationPath = mergeOutput
+        ? `${translationFolder}.md`
+        : translationFolder;
+      const translationSiblingPath = mergeOutput
+        ? translationFolder
+        : `${translationFolder}.md`;
+      const firstBlockStem = sanitizePathSegment(options.firstBlockName, "分块 1");
+      const firstBlockFileName = this.settings.numberSplitOutputFiles === false
+        ? `${firstBlockStem}.md`
+        : `1 ${firstBlockStem}.md`;
+      const attachmentReferencePath = mergeOutput
+        ? translationPath
+        : this.joinPath(translationFolder, firstBlockFileName);
 
       if (useSubfolder) {
         if (!this.app.vault.getAbstractFileByPath(outputFolder)) {
-          return { outputFolder, stem, ocrPath, translationPath, useSubfolder };
+          return {
+            outputFolder,
+            stem,
+            ocrPath,
+            translationPath,
+            translationFolder: mergeOutput ? null : translationFolder,
+            attachmentReferencePath,
+            mergeOutput,
+            useSubfolder,
+          };
         }
         continue;
       }
 
       if (
         !this.app.vault.getAbstractFileByPath(ocrPath) &&
-        !this.app.vault.getAbstractFileByPath(translationPath)
+        !this.app.vault.getAbstractFileByPath(translationPath) &&
+        !this.app.vault.getAbstractFileByPath(translationSiblingPath)
       ) {
-        return { outputFolder, stem, ocrPath, translationPath, useSubfolder };
+        return {
+          outputFolder,
+          stem,
+          ocrPath,
+          translationPath,
+          translationFolder: mergeOutput ? null : translationFolder,
+          attachmentReferencePath,
+          mergeOutput,
+          useSubfolder,
+        };
       }
     }
   }
@@ -2099,13 +2338,14 @@ class DeepSeekTranslatorPlugin extends Plugin {
     const settings = options.settings || this.settings;
     const referenceSourcePath = settings.keepOcrMarkdown
       ? outputPlan.ocrPath
-      : outputPlan.translationPath;
-    const imageCount = settings.extractImages
-      ? pages.reduce(
-          (total, page) => total + (page.images || []).filter((image) => image.imageBase64).length,
-          0,
-        )
-      : 0;
+      : outputPlan.attachmentReferencePath || outputPlan.translationPath;
+    const pageImageCandidates = settings.extractImages
+      ? pages.map((page) => this.referencedOcrImages(page))
+      : pages.map(() => []);
+    const imageCount = pageImageCandidates.reduce(
+      (total, candidates) => total + candidates.length,
+      0,
+    );
     const pageMarkdowns = [];
     let savedImageCount = 0;
     const pageNumberOffset = Math.max(0, Math.floor(Number(options.pageNumberOffset) || 0));
@@ -2119,27 +2359,20 @@ class DeepSeekTranslatorPlugin extends Plugin {
       let markdown = page.markdown || "";
 
       if (settings.extractImages) {
-        const images = page.images || [];
-        for (let imageOffset = 0; imageOffset < images.length; imageOffset += 1) {
-          const image = images[imageOffset];
-          if (!image.imageBase64) {
-            continue;
-          }
-
-          const originalId = String(image.id || `img-${imageOffset}.png`);
+        const imageCandidates = pageImageCandidates[pageOffset];
+        const imageReplacements = new Map();
+        for (const { image, imageOffset, originalId } of imageCandidates) {
           const imagePageNumber = Number.isFinite(image.pageIndex)
             ? pageNumberOffset + image.pageIndex + 1
             : pageNumber;
           const imageKey = `${imagePageNumber}:${imageOffset}:${originalId}`;
           const existing = existingImageLinks.get(imageKey);
           if (existing && this.app.vault.getAbstractFileByPath(existing.path)) {
-            markdown = replaceMistralImagePlaceholder(
-              markdown,
-              originalId,
-              existing.embeddedLink,
-            );
+            imageReplacements.set(originalId, existing.embeddedLink);
             savedImageCount += 1;
-            progress.update(`保存 OCR 图片 ${savedImageCount}/${imageCount}`);
+            image.imageBytes = null;
+            image.imageBase64 = null;
+            await this.reportOcrImageProgress(progress, savedImageCount, imageCount);
             continue;
           }
           if (existing) {
@@ -2152,35 +2385,69 @@ class DeepSeekTranslatorPlugin extends Plugin {
             imagePageNumber,
             imageOffset,
             originalId,
-            image.imageBase64,
+            image.imageBase64 || (image.mimeType ? `data:${image.mimeType};base64,` : ""),
           );
           const imagePath = await this.app.fileManager.getAvailablePathForAttachment(
             fileName,
             referenceSourcePath,
           );
-          const imageFile = await this.app.vault.createBinary(
-            imagePath,
-            base64ToArrayBuffer(stripDataUrlPrefix(image.imageBase64)),
-          );
-          let embeddedLink = this.app.fileManager.generateMarkdownLink(
-            imageFile,
-            referenceSourcePath,
-            undefined,
-            originalId,
-          );
+          const deterministicPath = this.joinPath(this.parentPath(imagePath), fileName);
+          let imageFile = this.app.vault.getAbstractFileByPath(deterministicPath);
+          let storedImagePath = deterministicPath;
+          let created = false;
+          const deterministicExists = imageFile instanceof TFile ||
+            (typeof this.app.vault.adapter.exists === "function" &&
+              await this.app.vault.adapter.exists(deterministicPath));
+          let deterministicSize = imageFile instanceof TFile
+            ? imageFile.stat?.size
+            : undefined;
+          if (
+            deterministicExists &&
+            !Number.isFinite(deterministicSize) &&
+            typeof this.app.vault.adapter.stat === "function"
+          ) {
+            deterministicSize = (await this.app.vault.adapter.stat(deterministicPath))?.size;
+          }
+          const deterministicUsable = deterministicExists &&
+            (!Number.isFinite(deterministicSize) || deterministicSize > 0);
+          if (!deterministicUsable) {
+            storedImagePath = deterministicExists ? deterministicPath : imagePath;
+            const imageBinary = image.imageBytes
+              ? this.toExactArrayBuffer(image.imageBytes)
+              : base64ToArrayBuffer(stripDataUrlPrefix(image.imageBase64));
+            if (typeof this.app.vault.adapter.writeBinary === "function") {
+              await this.app.vault.adapter.writeBinary(storedImagePath, imageBinary);
+              imageFile = this.app.vault.getAbstractFileByPath(storedImagePath);
+            } else {
+              imageFile = await this.app.vault.createBinary(storedImagePath, imageBinary);
+            }
+            created = true;
+          }
+          image.imageBytes = null;
+          image.imageBase64 = null;
+          let embeddedLink = imageFile instanceof TFile
+            ? this.app.fileManager.generateMarkdownLink(
+                imageFile,
+                referenceSourcePath,
+                undefined,
+                originalId,
+              )
+            : this.fallbackOcrImageLink(storedImagePath, originalId);
           if (!embeddedLink.startsWith("!")) {
             embeddedLink = `!${embeddedLink}`;
           }
           options.onImageSaved?.({
             key: imageKey,
-            path: imageFile.path,
+            path: storedImagePath,
             embeddedLink,
+            created,
           });
-          markdown = replaceMistralImagePlaceholder(markdown, originalId, embeddedLink);
+          imageReplacements.set(originalId, embeddedLink);
 
           savedImageCount += 1;
-          progress.update(`保存 OCR 图片 ${savedImageCount}/${imageCount}`);
+          await this.reportOcrImageProgress(progress, savedImageCount, imageCount);
         }
+        markdown = replaceMistralImagePlaceholders(markdown, imageReplacements);
       }
 
       pageMarkdowns.push(markdown.trimEnd());
@@ -2197,6 +2464,43 @@ class DeepSeekTranslatorPlugin extends Plugin {
     };
   }
 
+  fallbackOcrImageLink(path, alias) {
+    const safePath = String(path || "").replace(/\\/g, "/").replace(/\|/g, "%7C");
+    const safeAlias = String(alias || "图片").replace(/\|/g, "¦");
+    return `![[${safePath}|${safeAlias}]]`;
+  }
+
+  referencedOcrImages(page) {
+    const referencedIds = markdownImageBasenames(page?.markdown || "");
+    const candidates = [];
+    const seen = new Set();
+    const images = Array.isArray(page?.images) ? page.images : [];
+    for (let imageOffset = 0; imageOffset < images.length; imageOffset += 1) {
+      const image = images[imageOffset];
+      if (!image?.imageBase64 && !image?.imageBytes) {
+        continue;
+      }
+      const rawId = String(image.id || `img-${imageOffset}.png`);
+      const originalId = rawId.replace(/\\/g, "/").split("/").pop();
+      if (!referencedIds.has(originalId) || seen.has(originalId)) {
+        image.imageBytes = null;
+        image.imageBase64 = null;
+        continue;
+      }
+      seen.add(originalId);
+      candidates.push({ image, imageOffset, originalId });
+    }
+    return candidates;
+  }
+
+  async reportOcrImageProgress(progress, savedImageCount, imageCount) {
+    if (savedImageCount % 8 !== 0 && savedImageCount !== imageCount) {
+      return;
+    }
+    progress.update(`保存 OCR 图片 ${savedImageCount}/${imageCount}`);
+    await new Promise((resolve) => globalThis.setTimeout(resolve, 0));
+  }
+
   uniqueImageName(pdfBaseName, pdfHash, pageNumber, imageOffset, imageId, imageBase64) {
     const prefix = sanitizePathSegment(pdfBaseName, "PDF").slice(0, 80).trim();
     const extension = imageExtension(imageId, imageBase64);
@@ -2204,6 +2508,16 @@ class DeepSeekTranslatorPlugin extends Plugin {
     const imageStem = sanitizePathSegment(rawImageStem, `img-${imageOffset + 1}`).slice(0, 40);
     const page = String(pageNumber).padStart(4, "0");
     return `${prefix}--${pdfHash}--p${page}--${imageStem}.${extension}`;
+  }
+
+  toExactArrayBuffer(value) {
+    if (value instanceof ArrayBuffer) {
+      return value.slice(0);
+    }
+    if (ArrayBuffer.isView(value)) {
+      return value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+    }
+    throw new Error("OCR 图片数据格式无效");
   }
 
   async movePdfIfRequested(
@@ -2392,6 +2706,15 @@ class DeepSeekTranslatorSettingTab extends PluginSettingTab {
         text
           .setValue(this.plugin.settings.outputSuffix)
           .onChange((value) => this.updateSetting("outputSuffix", value)),
+      );
+
+    new Setting(containerEl)
+      .setName("分块译文文件名前添加序号")
+      .setDesc("仅在选择不合并分块译文时生效；例如“1 第一章.md”。关闭后保存为“第一章.md”。")
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.numberSplitOutputFiles !== false)
+          .onChange((value) => this.updateSetting("numberSplitOutputFiles", value)),
       );
 
     containerEl.createEl("h4", { text: "DeepSeek 设置" });

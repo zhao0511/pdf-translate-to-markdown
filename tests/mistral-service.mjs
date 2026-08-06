@@ -70,4 +70,19 @@ assert.equal(ocrInput.includeBlocks, false);
 assert.equal(await service.checkConnection(), true);
 assert.equal(calls.at(-1)[0], "models-list");
 
+const quotaError = new Error(
+  'API error occurred: Status 402. Body: {"detail":"Check your subscription"}',
+);
+const quotaService = new MistralOcrService(settings, () => ({
+  models: {
+    async list() {
+      throw quotaError;
+    },
+  },
+}));
+await assert.rejects(
+  quotaService.checkConnection(),
+  /可能是额度已用完或订阅不可用.*admin\.mistral\.ai\/subscription/,
+);
+
 console.log("Mistral service test passed");

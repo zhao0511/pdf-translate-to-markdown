@@ -291,6 +291,28 @@
   color: var(--text-error);
 }
 
+.pdf-translate-range-output {
+  flex: 0 0 auto;
+  margin-top: 0.65rem;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+}
+
+.pdf-translate-range-output label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: var(--font-ui-small);
+}
+
+.pdf-translate-range-output-description {
+  margin-top: 0.3rem;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.35;
+}
+
 .pdf-translate-range-row-header,
 .pdf-translate-range-row {
   display: grid;
@@ -387,6 +409,31 @@
   font-variant-numeric: tabular-nums;
   text-align: center;
   white-space: nowrap;
+}
+
+.pdf-translate-range-block-name {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: 3rem minmax(0, 1fr);
+  gap: 0.45rem;
+  align-items: center;
+  margin-top: 0.15rem;
+}
+
+.pdf-translate-range-block-name[hidden] {
+  display: none;
+}
+
+.pdf-translate-range-block-name span {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  text-align: right;
+}
+
+.pdf-translate-range-block-name input {
+  width: 100%;
+  min-width: 0;
+  height: 2rem;
 }
 
 .pdf-translate-range-status {

@@ -3,8 +3,10 @@ import { Modal, loadPdfJs } from "obsidian";
 import {
   PDF_MAX_PAGES_PER_PART,
   countSelectedPages,
+  createDefaultPdfBlockName,
   findPdfRangeGaps,
   shouldAutoFillPdfRangeEnd,
+  validatePdfBlockNames,
   validatePdfRanges,
 } from "./pdf-range-utils.mjs";
 
@@ -18,6 +20,7 @@ export class PdfRangeModal extends Modal {
     this.currentPreviewPage = 1;
     this.pendingPreviewPage = 1;
     this.previewZoomPercent = 100;
+    this.mergeOutput = true;
     this.pdfPageElements = new Map();
     this.pdfRenderTasks = new Map();
     this.pdfRenderPromises = new Map();
@@ -80,9 +83,9 @@ export class PdfRangeModal extends Modal {
     this.previewZoomSlider = zoomControls.createEl("input", {
       attr: {
         type: "range",
-        min: "50",
-        max: "200",
-        step: "10",
+        min: "25",
+        max: "150",
+        step: "5",
         value: "100",
         "aria-label": "PDF 显示大小",
       },
@@ -101,7 +104,10 @@ export class PdfRangeModal extends Modal {
     this.previewZoomSlider.addEventListener("input", () => {
       this.setPreviewZoom(Number(this.previewZoomSlider.value));
     });
-    this.previewZoomLabel.addEventListener("dblclick", () => this.setPreviewZoom(100));
+    this.previewZoomLabel.title = "双击恢复为适应窗口高度";
+    this.previewZoomLabel.addEventListener("dblclick", () => {
+      this.setPreviewZoom(this.fitHeightZoom(this.previewPageRatio));
+    });
 
     this.previewCanvasHost = preview.createDiv({ cls: "pdf-translate-pdf-canvas-host" });
     this.previewPagesEl = this.previewCanvasHost.createDiv({ cls: "pdf-translate-pdf-pages" });
@@ -138,6 +144,18 @@ export class PdfRangeModal extends Modal {
       const firstPage = await this.pdfPreviewDocument.getPage(1);
       const firstViewport = firstPage.getViewport({ scale: 1 });
       this.createPdfPagePlaceholders(firstViewport.width / firstViewport.height);
+      const ownerWindow = this.previewCanvasHost.ownerDocument?.defaultView || globalThis;
+      await new Promise((resolve) => {
+        if (typeof ownerWindow.requestAnimationFrame === "function") {
+          ownerWindow.requestAnimationFrame(() => resolve());
+        } else {
+          ownerWindow.setTimeout(resolve, 0);
+        }
+      });
+      if (this.settled) {
+        return;
+      }
+      this.setPreviewZoom(this.fitHeightZoom(firstViewport.width / firstViewport.height));
       this.observePdfPages();
       this.previewPreviousButton.disabled = false;
       this.previewNextButton.disabled = false;
@@ -157,6 +175,7 @@ export class PdfRangeModal extends Modal {
     const ratio = Number.isFinite(widthToHeightRatio) && widthToHeightRatio > 0
       ? widthToHeightRatio
       : 0.707;
+    this.previewPageRatio = ratio;
     for (let page = 1; page <= this.pageCount; page += 1) {
       const pageEl = this.previewPagesEl.createDiv({ cls: "pdf-translate-pdf-page" });
       pageEl.dataset.page = String(page);
@@ -242,7 +261,7 @@ export class PdfRangeModal extends Modal {
   }
 
   setPreviewZoom(value) {
-    const percent = Math.min(200, Math.max(50, Math.round(Number(value) / 10) * 10 || 100));
+    const percent = Math.min(150, Math.max(25, Math.round(Number(value) / 5) * 5 || 100));
     this.previewZoomPercent = percent;
     this.previewZoomSlider.value = String(percent);
     this.previewZoomLabel.setText(`${percent}%`);
@@ -256,6 +275,16 @@ export class PdfRangeModal extends Modal {
       this.previewZoomTimer = undefined;
       this.refreshPdfPagesForZoom();
     }, 120);
+  }
+
+  fitHeightZoom(widthToHeightRatio) {
+    const hostWidth = Math.max(1, this.previewCanvasHost?.clientWidth || 1);
+    const hostHeight = Math.max(1, this.previewCanvasHost?.clientHeight || 1);
+    const ratio = Number.isFinite(widthToHeightRatio) && widthToHeightRatio > 0
+      ? widthToHeightRatio
+      : 0.707;
+    const availableHeight = Math.max(200, hostHeight - 24);
+    return (availableHeight * ratio / hostWidth) * 100;
   }
 
   refreshPdfPagesForZoom() {
@@ -443,6 +472,22 @@ export class PdfRangeModal extends Modal {
       this.autoDetectButton.addEventListener("click", () => void this.runAutoDetect());
     }
 
+    const outputPanel = sidebar.createDiv({ cls: "pdf-translate-range-output" });
+    const outputLabel = outputPanel.createEl("label");
+    this.mergeOutputCheckbox = outputLabel.createEl("input", {
+      attr: { type: "checkbox", "aria-label": "合并分块译文" },
+    });
+    this.mergeOutputCheckbox.checked = true;
+    outputLabel.createSpan({ text: "合并分块译文为一个 Markdown 文件" });
+    outputPanel.createDiv({
+      cls: "pdf-translate-range-output-description",
+      text: "关闭后会创建一个译文文件夹，每块保存为单独的 Markdown 文件。",
+    });
+    this.mergeOutputCheckbox.addEventListener("change", () => {
+      this.mergeOutput = this.mergeOutputCheckbox.checked;
+      this.syncRowsAndValidation();
+    });
+
     const header = sidebar.createDiv({ cls: "pdf-translate-range-row-header" });
     header.createSpan({ text: "起始页" });
     header.createSpan({ text: "" });
@@ -463,7 +508,10 @@ export class PdfRangeModal extends Modal {
     this.cancelButton.addEventListener("click", () => this.finish(null));
     this.startButton.addEventListener("click", () => {
       if (this.currentRanges) {
-        this.finish(this.currentRanges);
+        this.finish({
+          ranges: this.currentRanges,
+          mergeOutput: this.mergeOutput,
+        });
       }
     });
 
@@ -483,6 +531,8 @@ export class PdfRangeModal extends Modal {
       autoFilled: false,
       title: options.title || "",
       type: options.type || "",
+      blockName: options.blockName || "",
+      blockNameAuto: options.blockNameAuto !== false,
     };
   }
 
@@ -530,6 +580,15 @@ export class PdfRangeModal extends Modal {
       cls: "pdf-translate-range-delete",
       attr: { type: "button", "aria-label": "删除这一部分" },
     });
+    const blockNameWrap = rowEl.createDiv({ cls: "pdf-translate-range-block-name" });
+    blockNameWrap.createSpan({ text: "块名" });
+    const blockNameInput = blockNameWrap.createEl("input", {
+      attr: {
+        type: "text",
+        placeholder: "输入这一块的文件名",
+        "aria-label": "分块文件名",
+      },
+    });
     startInput.addEventListener("dblclick", (event) => {
       event.preventDefault();
       event.stopPropagation();
@@ -570,6 +629,11 @@ export class PdfRangeModal extends Modal {
         nextInput.focus();
       }
     });
+    blockNameInput.addEventListener("input", () => {
+      row.blockName = blockNameInput.value;
+      row.blockNameAuto = false;
+      this.syncRowsAndValidation(blockNameInput);
+    });
     deleteButton.addEventListener("click", () => this.deleteRow(row));
 
     this.rowElements.set(row.id, {
@@ -580,6 +644,8 @@ export class PdfRangeModal extends Modal {
       titleEl,
       pageCountEl,
       deleteButton,
+      blockNameWrap,
+      blockNameInput,
     });
     this.updateRowElement(row);
   }
@@ -718,6 +784,20 @@ export class PdfRangeModal extends Modal {
     }
 
     const filled = this.isRowFilled(row);
+    if (filled && (row.blockNameAuto || !String(row.blockName || "").trim())) {
+      row.blockName = createDefaultPdfBlockName({
+        start: Number(row.start),
+        end: Number(row.end),
+        title: row.title,
+      });
+      row.blockNameAuto = true;
+    }
+    if (
+      elements.blockNameInput !== activeInput &&
+      elements.blockNameInput.value !== row.blockName
+    ) {
+      elements.blockNameInput.value = row.blockName;
+    }
     elements.rowEl.toggleClass("is-pending", !filled);
     elements.rowEl.toggleClass("is-autofilled", Boolean(row.autoFilled));
     elements.titleEl.setText(row.title || "手动分块");
@@ -733,6 +813,8 @@ export class PdfRangeModal extends Modal {
     elements.endInput.disabled = this.autoDetecting;
     elements.deleteButton.hidden = !filled;
     elements.deleteButton.disabled = this.autoDetecting || !filled;
+    elements.blockNameWrap.hidden = this.mergeOutput || !filled;
+    elements.blockNameInput.disabled = this.autoDetecting || this.mergeOutput || !filled;
   }
 
   updateValidation() {
@@ -748,10 +830,28 @@ export class PdfRangeModal extends Modal {
     }
 
     try {
-      const ranges = validatePdfRanges(
+      const validatedRanges = validatePdfRanges(
         completedRows.map((row) => ({ start: Number(row.start), end: Number(row.end) })),
         this.pageCount,
       );
+      const ranges = validatedRanges.map((range, index) => {
+        const row = completedRows.find(
+          (candidate) => Number(candidate.start) === range.start && Number(candidate.end) === range.end,
+        );
+        if (row && (row.blockNameAuto || !String(row.blockName || "").trim())) {
+          row.blockName = createDefaultPdfBlockName({ ...range, title: row.title }, index);
+          row.blockNameAuto = true;
+        }
+        return {
+          ...range,
+          title: row?.title || "",
+          type: row?.type || "",
+          blockName: row?.blockName || createDefaultPdfBlockName(range, index),
+        };
+      });
+      if (!this.mergeOutput) {
+        validatePdfBlockNames(ranges);
+      }
       this.currentRanges = ranges;
       const selectedPages = countSelectedPages(ranges);
       const longestRange = Math.max(...ranges.map(({ start, end }) => end - start + 1));
@@ -759,7 +859,7 @@ export class PdfRangeModal extends Modal {
       this.statusEl.setText(
         `已填写 ${ranges.length} 部分，共 ${selectedPages}/${this.pageCount} 页；最长一块 ${longestRange} 页。${
           hasPendingRow ? "灰色待填行不会参与处理。" : ""
-        }`,
+        }${this.mergeOutput ? "" : "译文将按块分别保存。"}`,
       );
       this.statusEl.removeClass("is-error");
       this.statusEl.addClass("is-valid");
@@ -835,6 +935,8 @@ export class PdfRangeModal extends Modal {
       autoFilled: true,
       title: String(range.title || ""),
       type: String(range.type || ""),
+      blockName: createDefaultPdfBlockName(range),
+      blockNameAuto: true,
     }));
     this.suppressNextAutoFill = true;
     this.renderAllRows();
@@ -857,6 +959,7 @@ export class PdfRangeModal extends Modal {
     for (const elements of this.rowElements.values()) {
       elements.startInput.disabled = this.autoDetecting;
       elements.endInput.disabled = this.autoDetecting;
+      elements.blockNameInput.disabled = this.autoDetecting || this.mergeOutput;
       elements.deleteButton.disabled = this.autoDetecting || elements.deleteButton.hidden;
     }
     if (this.startButton) {

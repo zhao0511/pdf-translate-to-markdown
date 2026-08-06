@@ -34,6 +34,7 @@ export const DEFAULT_SETTINGS = {
   mineruTimeoutMinutes: 30,
   pdfOutputMode: "same-folder",
   movePdfToSubfolder: false,
+  numberSplitOutputFiles: true,
   keepOcrMarkdown: false,
   extractImages: true,
   imageLimit: 0,

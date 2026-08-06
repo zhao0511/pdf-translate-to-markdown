@@ -1,7 +1,7 @@
 {
   "id": "pdf-translate-to-markdown",
   "name": "Pdf translate to markdown",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "minAppVersion": "1.5.7",
   "description": "Convert PDFs to Markdown with Mistral or MinerU and translate them with DeepSeek.",
   "author": "zhao0511",

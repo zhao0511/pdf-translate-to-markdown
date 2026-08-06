@@ -68,15 +68,41 @@ export function stripDataUrlPrefix(base64) {
 }
 
 export function replaceMistralImagePlaceholder(markdown, imageId, embeddedLink) {
+  return replaceMistralImagePlaceholders(markdown, new Map([[imageId, embeddedLink]]));
+}
+
+export function markdownImageBasenames(markdown) {
+  const basenames = new Set();
+  String(markdown || "").replace(
+    /!\[([^\]]*)\]\(([^)\n]+)\)/g,
+    (_fullMatch, _alt, targetWithTitle) => {
+      const basename = markdownImageTargetBasename(targetWithTitle);
+      if (basename) {
+        basenames.add(basename);
+      }
+      return _fullMatch;
+    },
+  );
+  return basenames;
+}
+
+export function replaceMistralImagePlaceholders(markdown, replacements) {
   return markdown.replace(/!\[([^\]]*)\]\(([^)\n]+)\)/g, (fullMatch, _alt, targetWithTitle) => {
-    const target = String(targetWithTitle).trim().split(/\s+["']/)[0];
-    let decodedTarget = target;
-    try {
-      decodedTarget = decodeURIComponent(target);
-    } catch (_error) {
-      // Keep the original target if it is not valid percent-encoded text.
-    }
-    const basename = decodedTarget.replace(/\\/g, "/").split("/").pop();
-    return basename === imageId ? embeddedLink : fullMatch;
+    const basename = markdownImageTargetBasename(targetWithTitle);
+    return replacements.get(basename) || fullMatch;
   });
+}
+
+function markdownImageTargetBasename(targetWithTitle) {
+  const rawTarget = String(targetWithTitle || "").trim().split(/\s+["']/)[0];
+  const target = rawTarget.startsWith("<") && rawTarget.endsWith(">")
+    ? rawTarget.slice(1, -1)
+    : rawTarget;
+  let decodedTarget = target;
+  try {
+    decodedTarget = decodeURIComponent(target);
+  } catch (_error) {
+    // Keep the original target if it is not valid percent-encoded text.
+  }
+  return decodedTarget.replace(/\\/g, "/").split("/").pop() || "";
 }

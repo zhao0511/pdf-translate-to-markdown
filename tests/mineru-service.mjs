@@ -21,6 +21,7 @@ const zipBytes = zipSync({
     ]),
   ),
   "result/images/hash.png": png,
+  "result/images/not-used.png": png,
 });
 
 const calls = [];
@@ -53,10 +54,15 @@ const requestFn = async (request) => {
           extract_result: [
             pollCount === 1
               ? {
+                  file_name: "paper.pdf",
                   state: "running",
                   extract_progress: { extracted_pages: 1, total_pages: 2 },
                 }
-              : { state: "done", full_zip_url: "https://download.example/result.zip" },
+              : {
+                  file_name: "paper.pdf",
+                  state: "done",
+                  full_zip_url: "https://download.example/result.zip",
+                },
           ],
         },
       },
@@ -95,7 +101,10 @@ service.wait = async () => {};
 
 assert.equal(await service.checkConnection(), true);
 const uploaded = await service.uploadPdf(new Uint8Array([1, 2, 3]).buffer, "paper.pdf");
-assert.deepEqual(uploaded, { fileId: "batch-1", url: "batch-1" });
+assert.equal(uploaded.fileId, "batch-1");
+assert.equal(uploaded.url.batchId, "batch-1");
+assert.equal(uploaded.url.fileName, "paper.pdf");
+assert.match(uploaded.url.dataId, /paper\.pdf$/);
 
 const uploadRequest = calls.find((call) => call.url.endsWith("/file-urls/batch"));
 const uploadBody = JSON.parse(uploadRequest.body);
@@ -119,7 +128,8 @@ assert.match(response.pages[0].markdown, /Title/);
 assert.equal(response.pages[0].images.length, 1);
 assert.equal(response.pages[0].images[0].id, "hash.png");
 assert.equal(response.pages[0].images[0].pageIndex, 1);
-assert.match(response.pages[0].images[0].imageBase64, /^data:image\/png;base64,/);
+assert.equal(response.pages[0].images[0].mimeType, "image/png");
+assert.equal(response.pages[0].images[0].imageBytes instanceof Uint8Array, true);
 assert.equal(statuses[0].extractedPages, 1);
 
 const invalidService = new MinerUOcrService(settings, async () => ({
@@ -153,11 +163,89 @@ await assert.rejects(
   retryService.uploadPdf(new Uint8Array([4, 5, 6]).buffer, "retry.pdf"),
   /HTTP 503/,
 );
-assert.deepEqual(
-  await retryService.uploadPdf(new Uint8Array([4, 5, 6]).buffer, "retry.pdf"),
-  { fileId: "batch-retry", url: "batch-retry" },
+const retryUploaded = await retryService.uploadPdf(
+  new Uint8Array([4, 5, 6]).buffer,
+  "retry.pdf",
 );
+assert.equal(retryUploaded.fileId, "batch-retry");
+assert.equal(retryUploaded.url.batchId, "batch-retry");
 assert.equal(retryPostCount, 1, "upload retries should reuse the existing MinerU batch");
 assert.equal(retryPutCount, 2);
+
+let preparedFiles = [];
+const batchUploadCalls = [];
+let batchDownloadCalls = 0;
+let batchPollCalls = 0;
+const batchService = new MinerUOcrService(settings, async (request) => {
+  if (request.url.endsWith("/file-urls/batch")) {
+    preparedFiles = JSON.parse(request.body).files;
+    return {
+      status: 200,
+      json: {
+        code: 0,
+        data: {
+          batch_id: "shared-batch",
+          file_urls: ["https://upload.example/a", "https://upload.example/b"],
+        },
+      },
+      text: "",
+    };
+  }
+  if (request.url.startsWith("https://upload.example/")) {
+    batchUploadCalls.push(request.url);
+    return { status: 200, json: null, text: "" };
+  }
+  if (request.url.endsWith("/extract-results/batch/shared-batch")) {
+    batchPollCalls += 1;
+    return {
+      status: 200,
+      json: {
+        code: 0,
+        data: {
+          extract_result: preparedFiles.map((file) => ({
+            file_name: file.name,
+            data_id: file.data_id,
+            state: "done",
+            full_zip_url: "https://download.example/shared.zip",
+          })),
+        },
+      },
+      text: "",
+    };
+  }
+  if (request.url === "https://download.example/shared.zip") {
+    batchDownloadCalls += 1;
+    return {
+      status: 200,
+      arrayBuffer: zipBytes.buffer.slice(
+        zipBytes.byteOffset,
+        zipBytes.byteOffset + zipBytes.byteLength,
+      ),
+      text: "",
+    };
+  }
+  throw new Error(`Unexpected batch request: ${request.method} ${request.url}`);
+});
+await batchService.prepareBatchUploads(["a.pdf", "b.pdf"]);
+const [batchA, batchB] = await Promise.all([
+  batchService.uploadPdf(new Uint8Array([1]).buffer, "a.pdf"),
+  batchService.uploadPdf(new Uint8Array([2]).buffer, "b.pdf"),
+]);
+assert.equal(batchA.fileId, "shared-batch");
+assert.equal(batchB.fileId, "shared-batch");
+assert.notEqual(batchA.url.dataId, batchB.url.dataId);
+assert.deepEqual(batchUploadCalls.sort(), ["https://upload.example/a", "https://upload.example/b"]);
+const [deferredA, deferredB] = await Promise.all([
+  batchService.processOcr(batchA.url, { deferLocalProcessing: true }),
+  batchService.processOcr(batchB.url, { deferLocalProcessing: true }),
+]);
+assert.equal(deferredA.deferredLocalProcessing, true);
+assert.equal(deferredB.deferredLocalProcessing, true);
+assert.equal(deferredA.resultZipUrl, "https://download.example/shared.zip");
+assert.equal(batchPollCalls, 1, "segments in one MinerU batch should share an in-flight poll");
+assert.equal(batchDownloadCalls, 0, "deferred MinerU results must not download on the polling path");
+const finalized = await batchService.materializeOcrResponse(deferredB);
+assert.equal(finalized.pageCount, 2);
+assert.equal(batchDownloadCalls, 1);
 
 console.log("MinerU service test passed");
