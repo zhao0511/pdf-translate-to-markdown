@@ -1,19 +1,24 @@
 # Pdf translate to markdown
 
-一个在 Obsidian 中完成 PDF 转 Markdown 和文档翻译的插件。
+一个在 Obsidian 中一键完成 PDF 转 Markdown 并翻译的插件。
 
-插件支持 Mistral OCR 与 MinerU 精准解析，可以把 PDF 转换为 Markdown、保存文档图片，并使用 DeepSeek 翻译为中文。也可以直接翻译 Vault 中已有的 Markdown 文件。
+插件支持 Mistral OCR 或 MinerU 精准解析，可以把 PDF 转换为 Markdown、将文档中的图片保存到本地，并使用 DeepSeek 翻译为中文。也可以翻译 Vault 中已有的 Markdown 文件，或只将 PDF 文件转为 Markdown 但不翻译。
 
 ## 主要功能
 
-- **PDF 转为 Markdown 并翻译**：解析 PDF 后自动生成中文 Markdown。
-- **仅将 PDF 转为 Markdown**：只转换文档，不调用 DeepSeek。
-- **翻译 Markdown**：直接翻译已有的 Markdown 文件。
-- 支持 Mistral OCR 和 MinerU 精准解析，并可为两个 PDF 功能分别选择服务。
+### 三大功能
+
+- **PDF 转为 Markdown 并翻译**
+- **仅将 PDF 转为 Markdown**
+- **翻译 Markdown**
+
+### 功能细节
+
+- 支持选择 Mistral OCR 或 MinerU 精准解析 PDF。
 - 长 PDF 支持手动选择页码范围，也可以根据目录自动按章节划分。
 - 多个分块可以并行处理，译文既可按原顺序合并，也可按块分别保存。
 - 图片自动保存到 Obsidian 配置的默认附件目录，并避免重名。
-- 任务失败时可以重试，并保留已经完成的步骤。
+- 任务失败时可以重试，并保留已经完成的中间结果。
 - 可选择将结果保存到 PDF 原目录，或放入 PDF 同名子文件夹。
 - 生成的文件会在 Obsidian 主文件区的新标签页中打开。
 - 支持调试记录、版本检查和插件内更新。
