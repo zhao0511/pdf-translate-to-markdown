@@ -62,6 +62,8 @@
 
 DeepSeek 用于 PDF 翻译和 Markdown 翻译。
 
+（补充：由于 deepseek 近日改变了调用 API 时使用的模型名称，因此还需在设置中把 功能设置-PDF转为Markdown并翻译-Deepseek设置-模型 中的模型名称从默认值改为“deepseek-flash”）
+
 ### Mistral
 
 - [创建 API 密钥](https://admin.mistral.ai/organization/api-keys)
